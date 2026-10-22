@@ -115,6 +115,8 @@ class PipelineModule(nn.Module):
         base_seed (int, optional): The starting seed. Defaults to 1234.
         partition_method (str, optional): The method upon which the layers are partitioned. Defaults to 'parameters'.
             ``'custom:n_0,n_1,...'`` gives stage ``s`` exactly ``n_s`` partitionable layers (see ``partition_layer_type``).
+            ``'profile:<plan.json>'`` runs a plan from ``deepspeed.runtime.pipe.planner``, which also sets
+            ``checkpoint_layers_per_stage`` and ``partition_layer_type`` unless they are given.
         activation_checkpoint_interval (int, optional): The granularity activation checkpointing in terms of number of layers. 0 disables activation checkpointing.
         activation_checkpoint_func (callable, optional): The function to use for activation checkpointing. Defaults to ``deepspeed.checkpointing.checkpoint``.
         checkpointable_layers (list[str], optional): List of layer class names that are eligible for checkpointing. For GPT models,
@@ -200,6 +202,16 @@ class PipelineModule(nn.Module):
         self._num_layers = len(self._layer_specs)
         self._local_start = 0
         self._local_stop = None
+        self.pipeline_plan = None
+        if isinstance(partition_method, str) and partition_method.lower().startswith('profile:'):
+            # a plan from deepspeed.runtime.pipe.planner; explicit arguments take precedence over it
+            from .planner import PipelinePlan
+            self.pipeline_plan = PipelinePlan.load(partition_method.split(':', 1)[1])
+            partition_method = self.pipeline_plan.partition_method
+            if partition_layer_type is None:
+                partition_layer_type = self.pipeline_plan.partition_layer_type
+            if checkpoint_layers_per_stage is None:
+                checkpoint_layers_per_stage = self.pipeline_plan.checkpoint_layers_per_stage
         self.partition_layer_type = partition_layer_type
         self._partitionable_idxs = (self._find_layer_type(partition_layer_type)
                                     if partition_layer_type is not None else list(range(self._num_layers)))
@@ -495,7 +507,9 @@ class PipelineModule(nn.Module):
         elif method.startswith('custom:'):
             self.parts = self._partition_custom(method.split(':', 1)[1])
         elif method == 'profile':
-            raise NotImplementedError(f'Partitioning method {method} not implemented.')
+            raise NotImplementedError("Partitioning method 'profile' needs a plan: build one with "
+                                      "`python -m deepspeed.runtime.pipe.planner` and pass "
+                                      "partition_method='profile:<plan.json>'.")
         else:
             raise NotImplementedError(f'Partitioning method {method} not implemented.')
 
