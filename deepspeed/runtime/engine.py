@@ -99,6 +99,7 @@ from deepspeed.runtime.sparse_tensor import SparseTensor
 from deepspeed.runtime import lr_schedules
 from deepspeed.utils import groups
 from deepspeed.utils import logger, log_dist, log_dist_once, instrument_w_nvtx
+from deepspeed.moe.aux_loss import set_aux_loss_grad_scale
 from deepspeed.utils.torch import required_torch_version, is_functorch_transforming
 from deepspeed.utils.z3_leaf_module import apply_zero_leaf_module_config
 from deepspeed.utils.timer import NoopTimer, ThroughputTimer, SynchronizedWallClockTimer, \
@@ -3407,6 +3408,8 @@ class DeepSpeedEngine(Module):
             if not self.managed_gradient_accumulation():
                 self._unmanaged_backward_count += 1
 
+            self._set_moe_aux_loss_grad_scale(scale_wrt_gas)
+
             # Set flag to prevent hooks from firing (we'll manually call prologue/epilogue)
             backward_kwargs = {"retain_graph": retain_graph}
 
@@ -3438,6 +3441,15 @@ class DeepSpeedEngine(Module):
             with self._running_engine_backward_lock:
                 self._running_engine_backward_count -= 1
                 self._running_engine_backward = self._running_engine_backward_count > 0
+
+    def _set_moe_aux_loss_grad_scale(self, scale_wrt_gas=True):
+        """Scale MoE auxiliary losses attached with ``deepspeed.moe.aux_loss`` like the main loss."""
+        scale = 1.0 / self.gradient_accumulation_steps() if scale_wrt_gas else 1.0
+        if self.fp16_enabled():
+            scale *= self._get_optimizer_loss_scale() or 1.0
+        elif self.torch_autocast_z0_gradscaler is not None:
+            scale *= self.torch_autocast_z0_gradscaler.get_scale()
+        set_aux_loss_grad_scale(scale)
 
     def is_gradient_accumulation_boundary(self):
         """

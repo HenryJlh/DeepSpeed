@@ -10,6 +10,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from deepspeed.utils import groups, log_dist
+from .aux_loss import attach_aux_loss
 from .experts import Experts
 from .sharded_moe import MOELayer, TopKGate
 
@@ -33,6 +34,10 @@ class MoE(nn.Module):
         use_tutel (bool, optional): default=False, whether to use Tutel optimizations (if installed).
         enable_expert_tensor_parallelism (bool, optional): default=False, whether to use tensor parallelism for experts
         top2_2nd_expert_sampling (bool, optional): default=True, whether to perform sampling for 2nd expert
+        aux_loss_coef (float, optional): default=None. If set, ``aux_loss_coef * l_aux`` is added to the training
+            objective through the output's backward pass (see ``deepspeed.moe.aux_loss``), which is what makes the
+            load-balancing loss work on every stage of a pipeline. The returned ``l_aux`` is then detached, for
+            logging only; do not add it to the loss.
     """
 
     def __init__(self,
@@ -50,11 +55,13 @@ class MoE(nn.Module):
                  use_rts: bool = True,
                  use_tutel: bool = False,
                  enable_expert_tensor_parallelism: bool = False,
-                 top2_2nd_expert_sampling: bool = True) -> None:
+                 top2_2nd_expert_sampling: bool = True,
+                 aux_loss_coef: Optional[float] = None) -> None:
 
         super(MoE, self).__init__()
 
         self.use_residual = use_residual
+        self.aux_loss_coef = aux_loss_coef
         self.enable_expert_tensor_parallelism = enable_expert_tensor_parallelism
         assert num_experts % ep_size == 0, f"Number of experts ({num_experts}) should be divisible by expert parallel size ({ep_size})"
         self.ep_size = ep_size
@@ -129,4 +136,8 @@ class MoE(nn.Module):
             coef = self.coefficient(hidden_states)
             coef = F.softmax(coef, dim=-1)
             output = output * coef[..., 0:1] + output_mlp * coef[..., 1:]
-        return output, self.deepspeed_moe.l_aux, self.deepspeed_moe.exp_counts
+        l_aux = self.deepspeed_moe.l_aux
+        if self.aux_loss_coef is not None:
+            output = attach_aux_loss(output, l_aux, self.aux_loss_coef)
+            l_aux = l_aux.detach()
+        return output, l_aux, self.deepspeed_moe.exp_counts

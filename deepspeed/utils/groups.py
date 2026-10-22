@@ -26,10 +26,11 @@
 """
 
 import os
+import socket
 import sys
 
 from deepspeed import comm as dist
-from deepspeed.utils import log_dist
+from deepspeed.utils import log_dist, logger
 from deepspeed.utils.bwc import bwc_tensor_model_parallel_world_size, bwc_pipeline_parallel_world_size
 from deepspeed.utils.exceptions import DeprecatedException
 from deepspeed.accelerator import get_accelerator
@@ -373,6 +374,49 @@ def _create_expert_and_data_parallel(expert_parallel_size_,
                                      mp_mode="tp",
                                      use_data_before_expert_parallel_=False,
                                      folding_spec=None):
+    """Create expert and data parallel groups; see ``_build_expert_and_data_parallel_groups``.
+
+    With pipeline parallelism, also warn if an expert-parallel group spans nodes: then the expert
+    all-to-all crosses the inter-node network on every MoE layer, whereas placing EP inside a node
+    and pipeline stages across nodes keeps it on the intra-node links (X-MoE-4D, SC'26).
+    """
+    group_name = f"ep_size_{expert_parallel_size_}"
+    created = group_name not in _EXPERT_PARALLEL_GROUP
+    _build_expert_and_data_parallel_groups(expert_parallel_size_,
+                                           mp_size=mp_size,
+                                           pp_size=pp_size,
+                                           mp_mode=mp_mode,
+                                           use_data_before_expert_parallel_=use_data_before_expert_parallel_,
+                                           folding_spec=folding_spec)
+    if pp_size is None:
+        pp_size = 1 if mpu is None else bwc_pipeline_parallel_world_size(mpu)
+    if created and pp_size > 1 and expert_parallel_size_ > 1:
+        _warn_if_expert_parallel_spans_nodes(group_name)
+
+
+def _expert_parallel_hosts(group_name):
+    """Host name of each rank in this rank's expert-parallel group. Collective over all ranks."""
+    hosts = [None] * dist.get_world_size()
+    dist.all_gather_object(hosts, socket.gethostname())
+    return [hosts[r] for r in _EXPERT_PARALLEL_GROUP_RANKS[group_name]]
+
+
+def _warn_if_expert_parallel_spans_nodes(group_name):
+    hosts = _expert_parallel_hosts(group_name)
+    ranks = list(_EXPERT_PARALLEL_GROUP_RANKS[group_name])
+    if len(set(hosts)) > 1 and dist.get_rank() == ranks[0]:
+        logger.warning(f"Expert-parallel group {group_name} with ranks {ranks} spans {len(set(hosts))} nodes "
+                       f"({sorted(set(hosts))}) while pipeline parallelism is enabled. Every MoE layer's "
+                       "all-to-all then crosses nodes; fitting each expert-parallel group in one node and "
+                       "spreading pipeline stages across nodes usually trains faster.")
+
+
+def _build_expert_and_data_parallel_groups(expert_parallel_size_,
+                                           mp_size=None,
+                                           pp_size=None,
+                                           mp_mode="tp",
+                                           use_data_before_expert_parallel_=False,
+                                           folding_spec=None):
     """Create expert and data parallel groups.
 
     When mp_size is None or 1: legacy consecutive ordering (backward compatible).

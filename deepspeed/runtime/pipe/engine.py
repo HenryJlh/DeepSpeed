@@ -12,6 +12,7 @@ import torch
 from deepspeed import comm as dist
 
 from deepspeed.utils import logger
+from deepspeed.moe.aux_loss import pop_recorded_aux_loss
 from deepspeed.utils.timer import ThroughputTimer
 from deepspeed.runtime.bf16_optimizer import BF16_Optimizer
 
@@ -201,6 +202,7 @@ class PipelineEngine(DeepSpeedEngine):
         # additional losses are stored as dict: {loss-name: agg-loss}
         self.agg_train_loss = None
         self.agg_additional_losses = None
+        self.agg_moe_aux_loss = None
 
         # use_reentrant picks the module's checkpoint function, and that choice also feeds
         # _is_checkpointable(), so resolve it whatever the configured interval is: the module's
@@ -373,6 +375,7 @@ class PipelineEngine(DeepSpeedEngine):
 
         with torch.no_grad():
             self.agg_train_loss = self._aggregate_total_loss()
+            self.agg_moe_aux_loss = self._aggregate_moe_aux_loss()
 
         self.timers(TRAIN_BATCH_TIMER).stop()
 
@@ -385,6 +388,8 @@ class PipelineEngine(DeepSpeedEngine):
                 if self.agg_additional_losses is not None:
                     for loss_name, loss_value in self.agg_additional_losses.items():
                         log_str += f'{loss_name}: {loss_value.item():0.4f} '
+                if self.agg_moe_aux_loss is not None:
+                    log_str += f'moe aux loss: {self.agg_moe_aux_loss.item():0.4f} '
                 log_str += f'iter time (s): {iter_time:0.3f} samples/sec: {tput:0.3f}'
                 print(log_str)
             else:
@@ -571,6 +576,24 @@ class PipelineEngine(DeepSpeedEngine):
         dist.broadcast(tensor=result, src=src_rank, group=self.mpu.get_pipe_parallel_group())
 
         return result
+
+    def _aggregate_moe_aux_loss(self):
+        """Mean scaled MoE auxiliary loss per attached layer and micro-batch, over all stages and replicas.
+
+        Only counts losses attached with ``deepspeed.moe.aux_loss``; None if no stage has any MoE layer.
+        """
+        if not hasattr(self, '_any_stage_has_moe'):
+            flag = torch.tensor([float(self.has_moe_layers)], device=self.device)
+            dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+            self._any_stage_has_moe = flag.item() > 0
+        total, count = pop_recorded_aux_loss()
+        if not self._any_stage_has_moe:
+            return None
+        sums = torch.tensor([0.0 if total is None else total.item(), float(count)], device=self.device)
+        dist.all_reduce(sums)
+        if sums[1] == 0:
+            return None
+        return sums[0] / sums[1]
 
     def _aggregate_total_loss(self):
         # Scale loss, average among DP ranks, and bcast loss to the rest of my DP group
@@ -840,6 +863,9 @@ class PipelineEngine(DeepSpeedEngine):
         if self.using_bf16_optimizer and not self.is_last_stage():
             # manually call because we don't call optimizer.backward()
             self.optimizer.clear_lp_grads()
+
+        # the received gradients are scaled like the last stage's loss; scale attached MoE aux losses alike
+        self._set_moe_aux_loss_grad_scale()
 
         # Set _running_engine_backward to avoid RuntimeError in post-backward hook
         # when needs_scaler=True (the hook checks this flag to skip error checking)
