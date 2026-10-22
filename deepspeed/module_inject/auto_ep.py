@@ -63,6 +63,11 @@ def _remove_transformers_output_capture_hooks(model: nn.Module) -> int:
     return removed
 
 
+def _is_pipeline_module(model: nn.Module) -> bool:
+    from deepspeed.runtime.pipe.module import PipelineModule
+    return isinstance(model, PipelineModule)
+
+
 def _is_known_hf_model_type(model_type: str | None) -> bool:
     if model_type is None:
         return False
@@ -411,8 +416,27 @@ class AutoEP:
         # the same buffer; another model's do not, even on the same group.
         self.deepep_scope = new_exchange_scope()
         self.model_config = getattr(model, 'config', None)
+        self._pipeline_module = _is_pipeline_module(model)
+        if self.model_config is None and self._pipeline_module:
+            # A pipeline stage holds wrapped layers of the HF model, not the model; HF submodules
+            # (attention, MoE blocks) keep a reference to its config.
+            self.model_config = next(
+                (m.config for m in model.modules() if hasattr(getattr(m, 'config', None), 'model_type')), None)
         self._retargeted_transformers_output_recorders: set[str] = set()
         fill_autoep_config_from_hf(self.config, self.model_config)
+
+    def _preset_relative_name(self, module_name: str) -> str:
+        """The name a preset pattern is matched against.
+
+        A ``PipelineModule`` registers its layers as ``"0"``, ``"1"``, ..., so a layer that keeps
+        the HF module path inside it (``<idx>.model.layers.<n>.mlp``) matches the HF preset once
+        the pipeline layer index is dropped.
+        """
+        if self._pipeline_module:
+            head, _, rest = module_name.partition('.')
+            if head.isdigit() and rest:
+                return rest
+        return module_name
 
     def ep_parser(self) -> list[MoELayerSpec]:
         """Traverse model and detect MoE layers. Returns list of MoELayerSpec."""
@@ -426,7 +450,7 @@ class AutoEP:
             pattern = re.compile(preset.moe_layer_pattern)
 
             for module_name, module in self.model.named_modules():
-                if not pattern.fullmatch(module_name):
+                if not pattern.fullmatch(self._preset_relative_name(module_name)):
                     continue
 
                 # Structural validation: check for experts child
