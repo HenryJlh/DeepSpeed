@@ -114,12 +114,21 @@ class PipelineModule(nn.Module):
         seed_fn(type, optional): The custom seed generating function. Defaults to random seed generator.
         base_seed (int, optional): The starting seed. Defaults to 1234.
         partition_method (str, optional): The method upon which the layers are partitioned. Defaults to 'parameters'.
+            ``'custom:n_0,n_1,...'`` gives stage ``s`` exactly ``n_s`` partitionable layers (see ``partition_layer_type``).
         activation_checkpoint_interval (int, optional): The granularity activation checkpointing in terms of number of layers. 0 disables activation checkpointing.
         activation_checkpoint_func (callable, optional): The function to use for activation checkpointing. Defaults to ``deepspeed.checkpointing.checkpoint``.
         checkpointable_layers (list[str], optional): List of layer class names that are eligible for checkpointing. For GPT models,
             ParallelTransformerLayerPipe is always checkpointed regardless of this list. If None, all layers with parameters are
             considered checkpointable. Defaults to None.
         dynamic_shape: Allows dynamic shapes of inputs. This might have a performance impact.
+        partition_layer_type (str, optional): Regex over layer class names, matched as in ``'type:'``, that selects the
+            layers counted by ``'custom:'`` partitioning and by ``checkpoint_layers_per_stage``. A layer it does not match
+            stays on the stage of the partitionable layer before it; leading ones go to the first stage. Defaults to
+            None, which counts every layer.
+        checkpoint_layers_per_stage (list[int], optional): Selective activation checkpointing. Stage ``s`` checkpoints its
+            first ``checkpoint_layers_per_stage[s]`` partitionable layers and no others (still subject to
+            ``checkpointable_layers``). Consecutive checkpointed layers are recomputed together, at most
+            ``activation_checkpoint_interval`` of them per call. An interval of 0 is raised to 1. Defaults to None.
     """
 
     def __init__(self,
@@ -134,7 +143,9 @@ class PipelineModule(nn.Module):
                  activation_checkpoint_interval=0,
                  activation_checkpoint_func=checkpointing.checkpoint,
                  checkpointable_layers=None,
-                 dynamic_shape=False):
+                 dynamic_shape=False,
+                 partition_layer_type=None,
+                 checkpoint_layers_per_stage=None):
 
         super().__init__()
 
@@ -189,7 +200,14 @@ class PipelineModule(nn.Module):
         self._num_layers = len(self._layer_specs)
         self._local_start = 0
         self._local_stop = None
+        self.partition_layer_type = partition_layer_type
+        self._partitionable_idxs = (self._find_layer_type(partition_layer_type)
+                                    if partition_layer_type is not None else list(range(self._num_layers)))
         self._partition_layers(method=partition_method)
+        self.checkpoint_layers_per_stage = None
+        if checkpoint_layers_per_stage is not None:
+            self._validate_checkpoint_layers_per_stage(checkpoint_layers_per_stage)
+            self.checkpoint_layers_per_stage = list(checkpoint_layers_per_stage)
 
         self.forward_funcs = []
         self.fwd_map = {}
@@ -201,12 +219,16 @@ class PipelineModule(nn.Module):
         #ds_utils.set_random_seed(newseed)
 
         self.activation_checkpoint_interval = activation_checkpoint_interval
+        if self.checkpoint_layers_per_stage is not None and self.activation_checkpoint_interval == 0:
+            self.activation_checkpoint_interval = 1
 
         self.activation_checkpoint_func = activation_checkpoint_func
 
         #storage for precomputed checkpointeble results
         self.is_checkpointable_results = []
         self.is_checkpointable_results_interval = None
+        # (start, end) local layer range of each entry of is_checkpointable_results
+        self.checkpoint_segment_bounds = []
 
         # if configuration use_reentrant = False, self.activation_checkpoint_func will be set to ``checkpointing.non_reentrant_checkpoint``
 
@@ -222,15 +244,74 @@ class PipelineModule(nn.Module):
     def _precompute_checkpointable_values(self):
         if self.activation_checkpoint_interval > 0 and self.is_checkpointable_results_interval != self.activation_checkpoint_interval:
             num_layers = len(self.forward_funcs)
+            interval = self.activation_checkpoint_interval
             self.interval_was_zero = False
             # results are cached per interval, so any left over from a previous interval no longer
             # line up with the layer blocks forward() builds and must not be carried over
             self.is_checkpointable_results = []
-            for start_idx in range(0, num_layers, self.activation_checkpoint_interval):
-                end_idx = min(start_idx + self.activation_checkpoint_interval, num_layers)
-                funcs = self.forward_funcs[start_idx:end_idx]
-                self.is_checkpointable_results.append(self._is_checkpointable(funcs))
+            self.checkpoint_segment_bounds = []
+            if self.checkpoint_layers_per_stage is None:
+                for start_idx in range(0, num_layers, interval):
+                    end_idx = min(start_idx + interval, num_layers)
+                    funcs = self.forward_funcs[start_idx:end_idx]
+                    self.is_checkpointable_results.append(self._is_checkpointable(funcs))
+                    self.checkpoint_segment_bounds.append((start_idx, end_idx))
+            else:
+                # one flag per local layer, then runs of equal flags, each cut to at most `interval` layers
+                flags = self._selective_checkpoint_flags()
+                start_idx = 0
+                while start_idx < num_layers:
+                    end_idx = start_idx + 1
+                    while (end_idx < num_layers and flags[end_idx] == flags[start_idx]
+                           and (not flags[start_idx] or end_idx - start_idx < interval)):
+                        end_idx += 1
+                    self.is_checkpointable_results.append(flags[start_idx])
+                    self.checkpoint_segment_bounds.append((start_idx, end_idx))
+                    start_idx = end_idx
             self.is_checkpointable_results_interval = self.activation_checkpoint_interval
+
+    def _local_stage(self):
+        """The (virtual) stage whose layers ``forward_funcs`` currently holds."""
+        for stage in range(self.num_stages):
+            if self.parts[stage] == self._local_start and self.parts[stage + 1] == self._local_stop:
+                return stage
+        raise RuntimeError(f'local layers [{self._local_start}, {self._local_stop}) are not a stage of {self.parts}')
+
+    def _selective_checkpoint_flags(self):
+        """Per local layer: is it one of the first ``checkpoint_layers_per_stage[s]`` partitionable layers."""
+        budget = self.checkpoint_layers_per_stage[self._local_stage()]
+        partitionable = set(self._partitionable_idxs)
+        flags, seen = [], 0
+        for local_idx, func in enumerate(self.forward_funcs):
+            selected = False
+            if local_idx + self._local_start in partitionable:
+                selected = seen < budget
+                seen += 1
+            flags.append(selected and self._is_checkpointable([func]))
+        return flags
+
+    def _validate_checkpoint_layers_per_stage(self, counts):
+        if len(counts) != self.num_stages:
+            raise ValueError(f'checkpoint_layers_per_stage has {len(counts)} entries for {self.num_stages} stages')
+        for stage, count in enumerate(counts):
+            owned = self._partitionable_count(stage)
+            if not isinstance(count, int) or count < 0 or count > owned:
+                raise ValueError(f'checkpoint_layers_per_stage[{stage}]={count} must be an int in [0, {owned}], '
+                                 f'the number of partitionable layers on that stage')
+
+    def _partitionable_count(self, stage):
+        start, stop = self.parts[stage], self.parts[stage + 1]
+        return sum(1 for idx in self._partitionable_idxs if start <= idx < stop)
+
+    def set_checkpoint_layers_per_stage(self, counts):
+        """Switch to selective checkpointing: stage ``s`` recomputes its first ``counts[s]`` partitionable layers."""
+        self._validate_checkpoint_layers_per_stage(counts)
+        self.checkpoint_layers_per_stage = list(counts)
+        if self.activation_checkpoint_interval == 0:
+            self.activation_checkpoint_interval = 1
+        # force a rebuild of the cached segments
+        self.is_checkpointable_results_interval = None
+        self._precompute_checkpointable_values()
 
     def _build(self):
         specs = self._layer_specs
@@ -374,14 +455,10 @@ class PipelineModule(nn.Module):
             func = exec_range_func(0, len(self.forward_funcs))
             x = func(forward_input)
         else:
-            num_layers = len(self.forward_funcs)
             x = forward_input
-            for start_idx, is_checkpointable_result in \
-                zip(range(0, num_layers, self.activation_checkpoint_interval), self.is_checkpointable_results):
+            for (start_idx, end_idx), is_checkpointable_result in \
+                zip(self.checkpoint_segment_bounds, self.is_checkpointable_results):
 
-                end_idx = min(start_idx + self.activation_checkpoint_interval, num_layers)
-
-                funcs = self.forward_funcs[start_idx:end_idx]
                 # Since we either pass tensors or tuples of tensors without unpacking, we
                 # need to be careful not to double-wrap tensors with tuple.
                 if not isinstance(x, tuple):
@@ -415,6 +492,8 @@ class PipelineModule(nn.Module):
             for idx in self._find_layer_type(layertype):
                 binary_weights[idx] = 1
             self.parts = ds_utils.partition_balanced(weights=binary_weights, num_parts=num_stages)
+        elif method.startswith('custom:'):
+            self.parts = self._partition_custom(method.split(':', 1)[1])
         elif method == 'profile':
             raise NotImplementedError(f'Partitioning method {method} not implemented.')
         else:
@@ -445,6 +524,28 @@ class PipelineModule(nn.Module):
                     print(f'  loss: {self.loss_fn.__class__.__name__}')
 
         self._set_bounds(start=self.parts[stage_id], stop=self.parts[stage_id + 1])
+
+    def _partition_custom(self, counts_str):
+        """Stage ``s`` gets ``counts[s]`` partitionable layers; each stage starts at its first one."""
+        try:
+            counts = [int(c) for c in counts_str.split(',')]
+        except ValueError:
+            raise ValueError(f"partition_method 'custom:{counts_str}' must be a comma-separated list of ints")
+        idxs = self._partitionable_idxs
+        if len(counts) != self.num_stages:
+            raise ValueError(f"partition_method 'custom:{counts_str}' has {len(counts)} entries for "
+                             f"{self.num_stages} stages")
+        if any(c < 1 for c in counts):
+            raise ValueError(f"partition_method 'custom:{counts_str}': every stage needs at least one layer")
+        if sum(counts) != len(idxs):
+            raise ValueError(f"partition_method 'custom:{counts_str}' assigns {sum(counts)} layers, but there are "
+                             f"{len(idxs)} partitionable layers")
+        parts, offset = [0], 0
+        for count in counts[:-1]:
+            offset += count
+            parts.append(idxs[offset])
+        parts.append(self._num_layers)
+        return parts
 
     @staticmethod
     def _recursive_getattr(module: torch.nn.Module, attr_name: str) -> torch.Tensor:
