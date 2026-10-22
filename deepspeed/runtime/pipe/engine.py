@@ -12,7 +12,7 @@ import torch
 from deepspeed import comm as dist
 
 from deepspeed.utils import logger
-from deepspeed.moe.aux_loss import pop_recorded_aux_loss
+from deepspeed.moe.aux_loss import aux_loss_attached, pop_recorded_aux_loss
 from deepspeed.utils.timer import ThroughputTimer
 from deepspeed.runtime.bf16_optimizer import BF16_Optimizer
 
@@ -580,20 +580,21 @@ class PipelineEngine(DeepSpeedEngine):
     def _aggregate_moe_aux_loss(self):
         """Mean scaled MoE auxiliary loss per attached layer and micro-batch, over all stages and replicas.
 
-        Only counts losses attached with ``deepspeed.moe.aux_loss``; None if no stage has any MoE layer.
+        Only counts losses attached with ``deepspeed.moe.aux_loss``; None if no rank attached any in the
+        first training batch, in which case no further collectives are issued for it.
         """
-        if not hasattr(self, '_any_stage_has_moe'):
-            flag = torch.tensor([float(self.has_moe_layers)], device=self.device)
+        if not hasattr(self, '_any_rank_attaches_aux_loss'):
+            # decided once, by every rank together, so that later steps issue the same collectives everywhere
+            flag = torch.tensor([float(aux_loss_attached())], device=self.device)
             dist.all_reduce(flag, op=dist.ReduceOp.MAX)
-            self._any_stage_has_moe = flag.item() > 0
+            self._any_rank_attaches_aux_loss = flag.item() > 0
         total, count = pop_recorded_aux_loss()
-        if not self._any_stage_has_moe:
+        if not self._any_rank_attaches_aux_loss:
             return None
-        sums = torch.tensor([0.0 if total is None else total.item(), float(count)], device=self.device)
+        total = torch.zeros((), device=self.device) if total is None else total.to(self.device)
+        sums = torch.stack([total, torch.tensor(float(count), device=self.device)])
         dist.all_reduce(sums)
-        if sums[1] == 0:
-            return None
-        return sums[0] / sums[1]
+        return sums[0] / sums[1].clamp(min=1)
 
     def _aggregate_total_loss(self):
         # Scale loss, average among DP ranks, and bcast loss to the rest of my DP group

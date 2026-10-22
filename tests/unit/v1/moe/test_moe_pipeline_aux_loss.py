@@ -12,6 +12,7 @@ from torch.utils.checkpoint import checkpoint
 
 import deepspeed
 import deepspeed.comm as dist
+from deepspeed.accelerator import get_accelerator
 from deepspeed.moe import aux_loss
 from deepspeed.moe.aux_loss import attach_aux_loss
 from deepspeed.moe.layer import MoE
@@ -133,6 +134,47 @@ class TestPipelineAuxLoss(DistributedTest):
             assert diff < 1e-6, f"{name}: max |pipeline - reference| = {diff}"
         if engine.stage_id == 0:
             assert not torch.allclose(engine.module.get_submodule("0").gate.weight.detach().cpu(), gate_before)
+
+    @pytest.mark.parametrize("precision", ["bf16", "fp16"])
+    def test_aux_loss_is_scaled_like_the_loss_in_mixed_precision(self, precision):
+        # The gates only get gradient from the aux loss, so their update shows whether the injected
+        # gradient carries the same 1/gas and fp16 loss scale as the main loss: a missing factor of
+        # 128 or 1/4 is far outside the tolerance, bf16/fp16 rounding is not.
+        acc = get_accelerator()
+        if precision == "fp16" and not acc.is_fp16_supported():
+            pytest.skip("fp16 is not supported on this accelerator")
+        if precision == "bf16" and not acc.is_bf16_supported():
+            pytest.skip("bf16 is not supported on this accelerator")
+        dtype = torch.float16 if precision == "fp16" else torch.bfloat16
+        gas, lr = 4, 1.0
+        torch.manual_seed(0)
+        layers = [AuxLayer(), AuxLayer(), nn.Linear(HIDDEN, HIDDEN), nn.Linear(HIDDEN, HIDDEN)]
+        for layer in layers:
+            layer.to(dtype)
+        reference = copy.deepcopy(nn.Sequential(*layers)).float()
+        for layer in reference:
+            if isinstance(layer, AuxLayer):
+                layer.attach = False
+        gates_before = [layers[i].gate.weight.detach().float().clone() for i in (0, 1)]
+        data = [(torch.randn(1, HIDDEN).to(dtype), torch.randn(1, HIDDEN).to(dtype)) for _ in range(gas)]
+
+        config = pipeline_config(gas)
+        config["optimizer"]["params"]["lr"] = lr
+        config[precision] = {"enabled": True, "loss_scale": 128} if precision == "fp16" else {"enabled": True}
+        model = PipelineModule(layers=layers, num_stages=2, loss_fn=nn.MSELoss(), partition_method="uniform")
+        engine, _, _, _ = deepspeed.initialize(config=config, model=model, model_parameters=model.parameters())
+        device = acc.device_name()
+        engine.train_batch(iter([(x.to(device), y.to(device)) for x, y in data]))
+
+        for x, y in data:
+            out = reference(x.float())
+            aux = sum(l.last_aux for l in reference if isinstance(l, AuxLayer))
+            ((F.mse_loss(out, y.float()) + COEF * aux) / gas).backward()
+        if engine.stage_id == 0:
+            for i, before in zip((0, 1), gates_before):
+                moved = engine.module.get_submodule(str(i)).gate.weight.detach().float().cpu() - before
+                expected = -lr * reference[i].gate.weight.grad
+                assert (moved - expected).norm() / expected.norm() < 0.1, f"gate {i}"
 
     def test_legacy_moe_layer_on_every_stage(self):
 

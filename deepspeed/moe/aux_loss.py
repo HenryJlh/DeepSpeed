@@ -18,18 +18,24 @@ import torch
 
 
 class _State:
+    # set once any auxiliary loss is attached; until then the engine does no aux-loss work at all
+    active = False
     grad_scale = 1.0
     total = None
     count = 0
 
 
+def aux_loss_attached():
+    """Whether this process has attached an auxiliary loss with :func:`attach_aux_loss`."""
+    return _State.active
+
+
 def set_aux_loss_grad_scale(scale):
-    """The factor the engine applies to the main loss before its backward pass."""
-    _State.grad_scale = float(scale)
+    """The factor the engine applies to the main loss before its backward pass.
 
-
-def get_aux_loss_grad_scale():
-    return _State.grad_scale
+    A float, or a 0-dim tensor (e.g. a GradScaler's device-side scale) to avoid a host sync.
+    """
+    _State.grad_scale = scale
 
 
 def pop_recorded_aux_loss():
@@ -52,7 +58,10 @@ class _AttachAuxLoss(torch.autograd.Function):
         value = aux_loss.detach().float()
         _State.total = value if _State.total is None else _State.total + value
         _State.count += 1
-        return grad_output, torch.full_like(aux_loss, _State.grad_scale)
+        scale = _State.grad_scale
+        if torch.is_tensor(scale):
+            return grad_output, scale.to(aux_loss.device, aux_loss.dtype).expand_as(aux_loss).clone()
+        return grad_output, torch.full_like(aux_loss, scale)
 
 
 def attach_aux_loss(output, aux_loss, coef=1.0):
@@ -63,4 +72,5 @@ def attach_aux_loss(output, aux_loss, coef=1.0):
     """
     if not torch.is_grad_enabled() or not torch.is_tensor(aux_loss) or not aux_loss.requires_grad:
         return output
+    _State.active = True
     return _AttachAuxLoss.apply(output, aux_loss * coef)
