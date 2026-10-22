@@ -282,6 +282,22 @@ class PipelineModule(nn.Module):
                     start_idx = end_idx
             self.is_checkpointable_results_interval = self.activation_checkpoint_interval
 
+    def _checkpoint_segments(self):
+        """The (start, end) layer range of each entry of ``is_checkpointable_results``.
+
+        Code that fills ``is_checkpointable_results`` itself, one entry per interval block as before
+        segments existed, gets those blocks back. A mismatch would make forward() skip layers.
+        """
+        if not self.checkpoint_segment_bounds and self.is_checkpointable_results:
+            num_layers, interval = len(self.forward_funcs), self.activation_checkpoint_interval
+            self.checkpoint_segment_bounds = [(s, min(s + interval, num_layers))
+                                              for s in range(0, num_layers, interval)]
+        if len(self.checkpoint_segment_bounds) != len(self.is_checkpointable_results):
+            raise RuntimeError(f'{len(self.is_checkpointable_results)} checkpointing decisions for '
+                               f'{len(self.checkpoint_segment_bounds)} layer segments; recompute them with '
+                               f'_precompute_checkpointable_values()')
+        return self.checkpoint_segment_bounds
+
     def _local_stage(self):
         """The (virtual) stage whose layers ``forward_funcs`` currently holds."""
         for stage in range(self.num_stages):
@@ -469,7 +485,7 @@ class PipelineModule(nn.Module):
         else:
             x = forward_input
             for (start_idx, end_idx), is_checkpointable_result in \
-                zip(self.checkpoint_segment_bounds, self.is_checkpointable_results):
+                zip(self._checkpoint_segments(), self.is_checkpointable_results):
 
                 # Since we either pass tensors or tuples of tensors without unpacking, we
                 # need to be careful not to double-wrap tensors with tuple.

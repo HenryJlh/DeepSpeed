@@ -339,3 +339,69 @@ class TestCustomPartitionTraining(DistributedTest):
         assert engine.module.checkpoint_layers_per_stage == [1, 1]
         assert sum(engine.module.is_checkpointable_results) == 1
         dist.barrier()
+
+
+class TestCheckpointSegments(DistributedTest):
+    world_size = 1
+
+    def test_results_without_segments_keep_interval_blocks(self):
+        # code written before segments existed fills is_checkpointable_results itself, one per interval block
+        layers = gpt_like_layers()
+        reference = nn.Sequential(*copy.deepcopy(layers))
+        model = PipelineModule(layers=layers, num_stages=1, activation_checkpoint_interval=4)
+        model.is_checkpointable_results = [False, True, False, True]
+        model.checkpoint_segment_bounds = []
+        x = torch.randn(2, HIDDEN_DIM, device=get_accelerator().device_name())
+        assert torch.allclose(model(x).cpu(), reference(x.cpu()), atol=1e-6)
+
+    def test_mismatch_raises_instead_of_skipping_layers(self):
+        model = PipelineModule(layers=gpt_like_layers(), num_stages=1, activation_checkpoint_interval=4)
+        model._precompute_checkpointable_values()
+        model.is_checkpointable_results = model.is_checkpointable_results[:-1]
+        with pytest.raises(RuntimeError, match="checkpointing decisions"):
+            model(torch.randn(2, HIDDEN_DIM, device=get_accelerator().device_name()))
+
+
+class TestCheckpointAcrossPartitions(DistributedTest):
+    world_size = 2
+
+    def test_uniform_checkpoint_loads_into_custom_partition(self, tmpdir):
+        config = {
+            "train_batch_size": 4,
+            "train_micro_batch_size_per_gpu": 1,
+            "steps_per_print": 1000,
+            "optimizer": {
+                "type": "Adam",
+                "params": {
+                    "lr": 0.01
+                }
+            },
+        }
+        gen = torch.Generator().manual_seed(1)
+        device = get_accelerator().device_name()
+        data = [(torch.randn(1, HIDDEN_DIM, generator=gen).to(device), torch.randn(1, HIDDEN_DIM,
+                                                                                   generator=gen).to(device))
+                for _ in range(4)]
+
+        def engine_for(layers, **kwargs):
+            model = PipelineModule(layers=layers, num_stages=2, loss_fn=nn.MSELoss(), **kwargs)
+            engine, _, _, _ = deepspeed.initialize(config=config,
+                                                   model=model,
+                                                   model_parameters=[p for p in model.parameters()])
+            return engine
+
+        saved = engine_for(gpt_like_layers(), partition_method="uniform")
+        saved.train_batch(iter(data))
+        expected = saved.eval_batch(iter(data)).item()
+        saved.save_checkpoint(tmpdir)
+
+        torch.manual_seed(7)  # different weights, so only the checkpoint can make the losses agree
+        fresh = [Pre(), Pre()] + [Block() for _ in range(8)] + [Post(), Post(), Post()]
+        loaded = engine_for(fresh,
+                            partition_method="custom:3,5",
+                            partition_layer_type="Block",
+                            checkpoint_layers_per_stage=[3, 2])
+        assert loaded.module.parts != saved.module.parts
+        assert loaded.eval_batch(iter(data)).item() != pytest.approx(expected, rel=1e-3)
+        loaded.load_checkpoint(tmpdir, load_optimizer_states=False, load_lr_scheduler_states=False)
+        assert loaded.eval_batch(iter(data)).item() == pytest.approx(expected, rel=1e-5)
