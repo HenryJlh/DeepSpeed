@@ -16,6 +16,8 @@ class LayerCost:
         activation_bytes: memory the forward keeps alive for the backward when the layer is not checkpointed.
         input_bytes: memory kept when the layer is checkpointed, i.e. its input.
         state_bytes: resident model states (parameters, gradients and optimizer states) for this layer.
+        transient_bytes: memory its backward needs only while it runs (gradient temporaries, the fp32
+            logits gradient of a head), on top of what it keeps between forward and backward.
         name: free-form label, e.g. the layer type.
     """
     fwd_ms: float
@@ -24,6 +26,7 @@ class LayerCost:
     input_bytes: float = 0.0
     state_bytes: float = 0.0
     name: str = ""
+    transient_bytes: float = 0.0
 
     def time_ms(self, checkpointed=False):
         """A checkpointed layer runs its forward a second time before the backward."""
@@ -47,7 +50,8 @@ class LayerCost:
                        fwd_ms=self.fwd_ms * factor,
                        bwd_ms=self.bwd_ms * factor,
                        activation_bytes=self.activation_bytes * factor,
-                       input_bytes=self.input_bytes * factor)
+                       input_bytes=self.input_bytes * factor,
+                       transient_bytes=self.transient_bytes * factor)
 
     def to_dict(self):
         return asdict(self)

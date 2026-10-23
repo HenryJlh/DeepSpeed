@@ -13,8 +13,13 @@ import torch.nn as nn
 from deepspeed.runtime.pipe.planner import (LayerCost, PipelinePlan, StageMemoryModel, evaluate_partition,
                                             model_state_bytes, pipeline_step_ms, profile_layer, saved_activation_bytes,
                                             search_micro_batch_size, solve_stages)
+from deepspeed.accelerator import get_accelerator
+from deepspeed.pipe import PipelineModule
+from deepspeed.runtime.pipe.planner import Calibration, fit_calibration, prediction_error, record_stage_memory
 from deepspeed.runtime.pipe.planner.__main__ import main as planner_main
 from deepspeed.runtime.pipe.planner.solver import _StageCosts
+
+from unit.common import DistributedTest
 
 GiB = 1024**3
 
@@ -29,7 +34,8 @@ def random_layers(rng, n):
                       bwd_ms=2 * fwd,
                       activation_bytes=act,
                       input_bytes=act / rng.uniform(5, 20),
-                      state_bytes=rng.uniform(1, 3) * GiB))
+                      state_bytes=rng.uniform(1, 3) * GiB,
+                      transient_bytes=rng.uniform(0, 2) * GiB))
     return layers
 
 
@@ -102,8 +108,8 @@ class TestSolver:
     def test_fast_stage_cost_matches_reference_model(self):
         rng = random.Random(0)
         layers = random_layers(rng, 6)
-        extra = [LayerCost(1, 2, activation_bytes=GiB, state_bytes=GiB)]
-        model = StageMemoryModel(3, 5, overhead_bytes=0.5 * GiB)
+        extra = [LayerCost(1, 2, activation_bytes=GiB, state_bytes=GiB, transient_bytes=3 * GiB)]
+        model = StageMemoryModel(3, 5, overhead_bytes=0.5 * GiB, state_factor=1.2, activation_factor=0.9)
         cost = _StageCosts(layers, 3, model, float("inf"), extra, extra)
         for s in range(3):
             # an infinite budget returns c = 0; check every c through the incremental path
@@ -234,10 +240,170 @@ class TestProfiler:
         block = nn.Sequential(nn.Linear(16, 16), nn.Tanh())
         assert saved_activation_bytes(block, (x, ))[0] == 2 * x.numel() * 4
 
+
+class _HeadLoss(nn.Module):
+    """A vocabulary head + loss: its backward materializes an fp32 logits gradient it never keeps."""
+
+    def __init__(self, hidden, vocab):
+        super().__init__()
+        self.lm_head = nn.Linear(hidden, vocab, bias=False)
+
+    def forward(self, x):
+        logits = self.lm_head(x).float()
+        return torch.nn.functional.cross_entropy(logits, torch.zeros(x.size(0), dtype=torch.long, device=x.device))
+
+
+class TestProfileLayer(DistributedTest):
+    # profiles on the accelerator, which a forked test process may only initialize under DistributedTest
+    world_size = 1
+
     def test_profile_layer(self):
-        layer = nn.Sequential(nn.Linear(16, 16), nn.Tanh())
-        cost = profile_layer(layer, (torch.randn(4, 16), ), warmup=1, iters=2, name="block")
+        device = get_accelerator().device_name()
+        layer = nn.Sequential(nn.Linear(16, 16), nn.Tanh()).to(device)
+        cost = profile_layer(layer, (torch.randn(4, 16, device=device), ), warmup=1, iters=2, name="block")
         assert cost.name == "block" and cost.fwd_ms > 0 and cost.bwd_ms >= 0
         assert cost.input_bytes == 4 * 16 * 4
         assert cost.activation_bytes == 2 * 4 * 16 * 4
         assert cost.state_bytes == model_state_bytes(16 * 16 + 16)
+        assert cost.transient_bytes >= 0
+
+    def test_backward_transient_of_a_head(self):
+        if get_accelerator().device_name() == "cpu":
+            pytest.skip("the cpu accelerator's peak counter is the process RSS")
+        tokens, vocab = 512, 8192
+        device = get_accelerator().device_name()
+        head = _HeadLoss(64, vocab).to(device)
+        cost = profile_layer(head, (torch.randn(tokens, 64, device=device), ), warmup=1, iters=1)
+        # the fp32 logits gradient exists only during the backward
+        assert cost.transient_bytes >= tokens * vocab * 4
+
+
+def synthetic_runs(layers, first, last, truth, partitions, micro_batches=8):
+    """Calibration runs whose peaks a memory model with factors ``truth`` would measure exactly."""
+    runs = []
+    for counts, ckpt in partitions:
+        model = StageMemoryModel(len(counts),
+                                 micro_batches,
+                                 overhead_bytes=truth.overhead_bytes,
+                                 state_factor=truth.state_factor,
+                                 activation_factor=truth.activation_factor)
+        peaks, start = [], 0
+        for s, (n, c) in enumerate(zip(counts, ckpt)):
+            extras = (first if s == 0 else []) + (last if s == len(counts) - 1 else [])
+            peaks.append(model.stage_bytes(s, layers[start:start + n], c, extras))
+            start += n
+        runs.append({
+            "layers_per_stage": counts,
+            "checkpoint_layers_per_stage": ckpt,
+            "micro_batch_size": 1,
+            "micro_batches": micro_batches,
+            "peak_allocated_bytes": peaks,
+            "peak_reserved_bytes": peaks,
+        })
+    return runs
+
+
+class TestCalibration:
+    partitions = [([3, 3, 3, 3], [3, 3, 3, 3]), ([2, 4, 4, 2], [1, 0, 0, 0]), ([4, 3, 3, 2], [2, 1, 0, 0])]
+
+    def costs(self):
+        rng = random.Random(3)
+        layers = random_layers(rng, 12)
+        first = [LayerCost(1, 2, activation_bytes=0.1 * GiB, state_bytes=4 * GiB)]
+        last = [LayerCost(5, 10, activation_bytes=2 * GiB, state_bytes=4 * GiB, transient_bytes=3 * GiB)]
+        return layers, first, last
+
+    def test_recovers_the_factors_that_produced_the_peaks(self):
+        layers, first, last = self.costs()
+        truth = Calibration(state_factor=1.3, activation_factor=0.75, overhead_bytes=2.5 * GiB)
+        runs = synthetic_runs(layers, first, last, truth, self.partitions)
+        fit = fit_calibration(runs, lambda mbs: (layers, first, last))
+        assert fit.state_factor == pytest.approx(1.3, rel=1e-6)
+        assert fit.activation_factor == pytest.approx(0.75, rel=1e-6)
+        assert fit.overhead_bytes == pytest.approx(2.5 * GiB, rel=1e-6)
+        assert fit.fit_mae_bytes < 1e-3 * GiB and fit.loo_mae_bytes < 1e-3 * GiB
+        assert fit.num_points == 12
+
+    def test_factors_stay_non_negative(self):
+        layers, first, last = self.costs()
+        runs = synthetic_runs(layers, first, last, Calibration(), self.partitions)
+        for run in runs:  # peaks below what the states alone need would ask for a negative overhead
+            run["peak_reserved_bytes"] = [p - 20 * GiB for p in run["peak_reserved_bytes"]]
+        fit = fit_calibration(runs, lambda mbs: (layers, first, last))
+        assert min(fit.state_factor, fit.activation_factor, fit.overhead_bytes) >= 0
+
+    def test_calibrated_prediction_matches_an_unseen_partition(self):
+        layers, first, last = self.costs()
+        truth = Calibration(state_factor=1.25, activation_factor=0.8, overhead_bytes=3 * GiB)
+        seen = synthetic_runs(layers, first, last, truth, self.partitions[:2])
+        unseen = synthetic_runs(layers, first, last, truth, self.partitions[2:])
+        fit = fit_calibration(seen, lambda mbs: (layers, first, last))
+        for predicted, measured in prediction_error(unseen, lambda mbs: (layers, first, last), fit)[0]:
+            assert predicted == pytest.approx(measured, rel=1e-6)
+        raw = prediction_error(unseen, lambda mbs: (layers, first, last))[0]
+        assert any(abs(p - m) > GiB for p, m in raw)  # uncalibrated, the same prediction is off
+
+    def test_cli_plans_with_the_calibrated_model(self, tmp_path, capsys):
+        layers, first, last = self.costs()
+        runs = synthetic_runs(layers, first, last, Calibration(state_factor=1.25, overhead_bytes=4 * GiB),
+                              self.partitions)
+        costs = {
+            "layers": [l.to_dict() for l in layers],
+            "first_stage_extra": [first[0].to_dict()],
+            "last_stage_extra": [last[0].to_dict()]
+        }
+        cpath, rpath, ppath = tmp_path / "costs.json", tmp_path / "runs.json", tmp_path / "plan.json"
+        cpath.write_text(json.dumps(costs))
+        rpath.write_text(json.dumps(runs))
+        args = [
+            "--costs",
+            str(cpath), "--stages", "4", "--memory-gb", "200", "--global-batch-size", "8", "--micro-batch-sizes", "1",
+            "-o",
+            str(ppath)
+        ]
+        assert planner_main(args + ["--calibration", str(rpath)]) == 0
+        assert "state x1.250" in capsys.readouterr().out
+        calibrated = PipelinePlan.load(ppath)
+        assert calibrated.notes["calibration"]["overhead_bytes"] == pytest.approx(4 * GiB, rel=1e-6)
+        assert planner_main(args) == 0
+        # the calibrated model predicts more memory for the same partition
+        assert max(s.memory_bytes for s in calibrated.stages) > max(s.memory_bytes
+                                                                    for s in PipelinePlan.load(ppath).stages)
+
+
+class TestRecordStageMemory(DistributedTest):
+    world_size = 2
+
+    def test_records_one_run_per_call(self, tmpdir):
+        import deepspeed
+        layers = [nn.Linear(8, 8) for _ in range(6)]
+        model = PipelineModule(layers=layers,
+                               num_stages=2,
+                               loss_fn=nn.MSELoss(),
+                               partition_method="custom:2,4",
+                               checkpoint_layers_per_stage=[1, 0])
+        config = {
+            "train_batch_size": 4,
+            "train_micro_batch_size_per_gpu": 1,
+            "steps_per_print": 1000,
+            "optimizer": {
+                "type": "Adam",
+                "params": {
+                    "lr": 0.01
+                }
+            }
+        }
+        engine, _, _, _ = deepspeed.initialize(config=config, model=model, model_parameters=list(model.parameters()))
+        device = get_accelerator().device_name()
+        engine.train_batch(iter([(torch.randn(1, 8, device=device), torch.randn(1, 8, device=device))] * 4))
+        path = str(tmpdir / f"runs_{engine.global_rank}.json")
+        for _ in range(2):
+            run = record_stage_memory(engine, path, partition="custom:2,4")
+        if engine.global_rank == 0:
+            assert run["layers_per_stage"] == [2, 4]
+            assert run["checkpoint_layers_per_stage"] == [1, 0]
+            assert run["micro_batches"] == 4 and run["micro_batch_size"] == 1
+            assert len(run["peak_reserved_bytes"]) == 2 and min(run["peak_allocated_bytes"]) > 0
+            assert len(json.load(open(path))) == 2
+        else:
+            assert run is None

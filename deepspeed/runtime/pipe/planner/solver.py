@@ -15,7 +15,7 @@ from dataclasses import dataclass, field, asdict
 from typing import Callable, List, Optional, Sequence
 
 from .cost import LayerCost
-from .memory import StageMemoryModel
+from .memory import StageMemoryModel, layer_transient_bytes
 
 PLAN_VERSION = 1
 INF = float("inf")
@@ -102,6 +102,17 @@ def pipeline_step_ms(stage_ms, micro_batches, per_micro_batch_overhead_ms=0.0, o
     return sum(times) + (micro_batches - 1) * max(times) + optimizer_ms
 
 
+def _memory_model(num_stages, micro_batches, inflight, overhead_bytes, calibration):
+    if calibration is None:
+        return StageMemoryModel(num_stages, micro_batches, inflight=inflight, overhead_bytes=overhead_bytes)
+    return StageMemoryModel(num_stages,
+                            micro_batches,
+                            inflight=inflight,
+                            overhead_bytes=calibration.overhead_bytes,
+                            state_factor=calibration.state_factor,
+                            activation_factor=calibration.activation_factor)
+
+
 class _StageCosts:
     """Cheapest feasible way to run layers [a, b) as stage s, with prefix sums over the layer list."""
 
@@ -129,22 +140,21 @@ class _StageCosts:
         return self.cache[key]
 
     def _solve(self, stage_id, a, b):
-        # Same quantities as StageMemoryModel.stage_bytes, updated in O(1) per extra checkpointed layer.
+        # Same quantities as StageMemoryModel.components, updated in O(1) per extra checkpointed layer.
         layers = self.layers[a:b]
         extras = self.extras(stage_id)
         model = self.memory_model
-        inflight = model.inflight(stage_id, model.num_stages, model.micro_batches)
         states = sum(l.state_bytes for l in layers) + sum(e.state_bytes for e in extras)
         kept = sum(l.activation_bytes for l in layers) + sum(e.activation_bytes for e in extras)
         time = sum(l.time_ms() for l in layers) + sum(e.time_ms() for e in extras)
-        transient = 0.0
+        transient = max([layer_transient_bytes(l, False) for l in layers + extras], default=0.0)
         for c in range(len(layers) + 1):
             if c > 0:
                 layer = layers[c - 1]
                 kept += layer.input_bytes - layer.activation_bytes
-                transient = max(transient, layer.activation_bytes)
+                transient = max(transient, layer_transient_bytes(layer, True))
                 time += layer.fwd_ms
-            memory = states + inflight * kept + transient + model.overhead_bytes
+            memory = model.combine(stage_id, states, kept, transient)
             if memory <= self.limit:
                 return time, c, memory
         return INF, len(layers), INF
@@ -157,16 +167,18 @@ def solve_stages(layers: Sequence[LayerCost],
                  first_stage_extra: Sequence[LayerCost] = (),
                  last_stage_extra: Sequence[LayerCost] = (),
                  inflight="1f1b",
-                 overhead_bytes: float = 0.0) -> Optional[List[StagePlan]]:
+                 overhead_bytes: float = 0.0,
+                 calibration=None) -> Optional[List[StagePlan]]:
     """Split ``layers`` (the partitionable layers, in order) into ``num_stages`` contiguous stages.
 
     Minimizes the slowest stage's time over all splits that give every stage at least one layer
     and keep every stage within ``memory_limit_bytes``. Returns None if no split fits.
+    ``calibration`` (a ``Calibration``) replaces ``overhead_bytes`` and scales the memory model.
     """
     n = len(layers)
     if n < num_stages:
         raise ValueError(f"{n} layers cannot fill {num_stages} stages")
-    model = StageMemoryModel(num_stages, micro_batches, inflight=inflight, overhead_bytes=overhead_bytes)
+    model = _memory_model(num_stages, micro_batches, inflight, overhead_bytes, calibration)
     cost = _StageCosts(list(layers), num_stages, model, memory_limit_bytes, first_stage_extra, last_stage_extra)
 
     # best[k][i]: slowest-stage time when the first i layers form stages 0..k-1
@@ -205,7 +217,8 @@ def search_micro_batch_size(layer_costs: Callable[[int], tuple],
                             overhead_bytes: float = 0.0,
                             per_micro_batch_overhead_ms: float = 0.0,
                             optimizer_ms: float = 0.0,
-                            partition_layer_type: Optional[str] = None) -> Optional[PipelinePlan]:
+                            partition_layer_type: Optional[str] = None,
+                            calibration=None) -> Optional[PipelinePlan]:
     """Plan for every micro-batch size in ``candidates`` and keep the fastest step.
 
     ``layer_costs(mbs)`` returns ``(layers, first_stage_extra, last_stage_extra)`` for that micro-batch
@@ -224,7 +237,8 @@ def search_micro_batch_size(layer_costs: Callable[[int], tuple],
                               first_stage_extra=first,
                               last_stage_extra=last,
                               inflight=inflight,
-                              overhead_bytes=overhead_bytes)
+                              overhead_bytes=overhead_bytes,
+                              calibration=calibration)
         if stages is None:
             continue
         step = pipeline_step_ms([s.time_ms for s in stages], micro_batches, per_micro_batch_overhead_ms, optimizer_ms)
@@ -247,10 +261,11 @@ def evaluate_partition(layers,
                        first_stage_extra=(),
                        last_stage_extra=(),
                        inflight="1f1b",
-                       overhead_bytes=0.0):
+                       overhead_bytes=0.0,
+                       calibration=None):
     """Predicted time and memory of a given partition, e.g. a uniform baseline, under the same model."""
     num_stages = len(layers_per_stage)
-    model = StageMemoryModel(num_stages, micro_batches, inflight=inflight, overhead_bytes=overhead_bytes)
+    model = _memory_model(num_stages, micro_batches, inflight, overhead_bytes, calibration)
     cost = _StageCosts(list(layers), num_stages, model, memory_limit_bytes, first_stage_extra, last_stage_extra)
     stages, start = [], 0
     for s, (n, c) in enumerate(zip(layers_per_stage, checkpoint_layers_per_stage)):

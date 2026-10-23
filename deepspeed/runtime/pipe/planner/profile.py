@@ -36,6 +36,31 @@ def saved_activation_bytes(module, inputs):
     return total[0], out
 
 
+def backward_transient_bytes(module, inputs):
+    """Peak memory the backward needs beyond what the forward left allocated, gradients excluded.
+
+    Gradients of parameters are model states; the rest (the gradient flowing in, gradients of the
+    inputs, kernel workspaces, an fp32 logits gradient) only lives while the backward runs.
+    Measured with the accelerator's peak-memory counter, so it is only as exact as that counter.
+    """
+    acc = get_accelerator()
+    module.zero_grad(set_to_none=True)
+    for x in inputs:
+        if torch.is_tensor(x):
+            x.grad = None  # the gradient sent to the previous stage is new memory in the pipeline
+    acc.synchronize()
+    out = _first_tensor(module(*inputs))
+    acc.synchronize()
+    after_forward = acc.memory_allocated()
+    acc.reset_peak_memory_stats()
+    out.backward(torch.ones_like(out))
+    acc.synchronize()
+    peak = acc.max_memory_allocated()
+    grads = sum(_tensor_bytes(p.grad) for p in module.parameters() if p.grad is not None)
+    module.zero_grad(set_to_none=True)
+    return max(0.0, float(peak - after_forward - grads))
+
+
 def _first_tensor(out):
     if torch.is_tensor(out):
         return out
@@ -80,6 +105,7 @@ def profile_layer(module, inputs, warmup=3, iters=10, name="", zero_stage=0, dp_
 
     activation, out = saved_activation_bytes(module, inputs)
     del out
+    transient = backward_transient_bytes(module, inputs)
     input_bytes = sum(_tensor_bytes(x) for x in inputs if torch.is_tensor(x) and x.is_floating_point())
     if state_bytes is None:
         num_params = sum(p.numel() for p in module.parameters() if p.requires_grad)
@@ -89,4 +115,5 @@ def profile_layer(module, inputs, warmup=3, iters=10, name="", zero_stage=0, dp_
                      activation_bytes=float(activation),
                      input_bytes=float(input_bytes),
                      state_bytes=float(state_bytes),
-                     name=name or type(module).__name__)
+                     name=name or type(module).__name__,
+                     transient_bytes=float(transient))

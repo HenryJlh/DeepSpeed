@@ -17,6 +17,10 @@
 
 Each entry has the fields of :class:`LayerCost`; ``fwd_gemm_ms`` + ``fwd_comm_ms`` may replace
 ``fwd_ms`` + ``bwd_ms`` to use the X-MoE-4D cost formula.
+
+``--calibration runs.json`` fits the memory model to stage peaks recorded with
+``deepspeed.runtime.pipe.planner.record_stage_memory`` in short runs of other partitions, and plans
+with the fitted model; it reports the fit error and, with two or more runs, the leave-one-run-out error.
 """
 
 import argparse
@@ -24,6 +28,7 @@ import json
 import sys
 
 from .cost import LayerCost
+from .calibrate import fit_calibration, load_runs
 from .solver import evaluate_partition, pipeline_step_ms, search_micro_batch_size
 
 GiB = 1024**3
@@ -91,12 +96,25 @@ def main(argv=None):
     p.add_argument("--overhead-gb", type=float, default=0.0, help="per-GPU memory reserved outside the model")
     p.add_argument("--per-micro-batch-overhead-ms", type=float, default=0.0)
     p.add_argument("--partition-layer-type", default=None, help="stored in the plan for PipelineModule")
+    p.add_argument("--calibration",
+                   default=None,
+                   help="stage peaks measured with calibrate.record_stage_memory (JSON); fit the memory "
+                   "model to them and plan with it (replaces --overhead-gb)")
+    p.add_argument("--fit-target", default="reserved", choices=["reserved", "allocated"])
     p.add_argument("-o", "--output", default="pipeline_plan.json")
     a = p.parse_args(argv)
 
     with open(a.costs) as f:
         layer_costs = load_costs(json.load(f))
     limit = a.memory_gb * GiB
+    calibration = None
+    if a.calibration:
+        calibration = fit_calibration(load_runs(a.calibration), layer_costs, inflight=a.inflight, target=a.fit_target)
+        print(
+            f"calibration ({a.fit_target} peaks, {calibration.num_points} stage measurements): "
+            f"state x{calibration.state_factor:.3f}, activation x{calibration.activation_factor:.3f}, "
+            f"overhead {calibration.overhead_bytes / GiB:.2f} GiB; fit MAE {calibration.fit_mae_bytes / GiB:.2f} GiB, "
+            f"leave-one-run-out MAE {calibration.loo_mae_bytes / GiB:.2f} GiB")
     plan = search_micro_batch_size(layer_costs, [int(x) for x in a.micro_batch_sizes.split(",")],
                                    a.global_batch_size,
                                    a.dp,
@@ -105,7 +123,8 @@ def main(argv=None):
                                    inflight=a.inflight,
                                    overhead_bytes=a.overhead_gb * GiB,
                                    per_micro_batch_overhead_ms=a.per_micro_batch_overhead_ms,
-                                   partition_layer_type=a.partition_layer_type)
+                                   partition_layer_type=a.partition_layer_type,
+                                   calibration=calibration)
     if plan is None:
         print("no partition fits the memory budget for any candidate micro-batch size", file=sys.stderr)
         return 1
@@ -124,10 +143,13 @@ def main(argv=None):
                                     first,
                                     last,
                                     inflight=a.inflight,
-                                    overhead_bytes=a.overhead_gb * GiB)
+                                    overhead_bytes=a.overhead_gb * GiB,
+                                    calibration=calibration)
         _report(label, stages, plan.micro_batches, limit, a.per_micro_batch_overhead_ms)
 
     plan.notes = {"costs": a.costs, "memory_gb": a.memory_gb, "inflight": a.inflight}
+    if calibration is not None:
+        plan.notes["calibration"] = calibration.to_dict()
     plan.save(a.output)
     print(f"wrote {a.output}: partition_method='profile:{a.output}'")
     return 0
