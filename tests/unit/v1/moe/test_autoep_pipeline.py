@@ -136,5 +136,5 @@ class TestAutoEPInPipeline(DistributedTest):
         for step in range(STEPS):
             loss = engine.train_batch(iter([(x, x) for x in data[step]]))
             if zero_stage == 1:  # the basic fp32 optimizer path does not record the norm
-                assert engine.get_global_grad_norm() == pytest.approx(reference[step][1], rel=1e-4)
+                assert float(engine.get_global_grad_norm()) == pytest.approx(reference[step][1], rel=1e-4)
             assert loss.item() == pytest.approx(reference[step][0], rel=1e-5)
