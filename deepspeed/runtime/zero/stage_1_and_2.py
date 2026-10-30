@@ -1911,7 +1911,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         self._record_offload_copy()
         self.clear_grad_attribute(param)  #offload only
 
-    def complete_grad_norm_calculation_for_cpu_offload(self, params):
+    def complete_grad_norm_calculation_for_cpu_offload(self, params, model_parallel_reduce=True):
         total_norm = 0.0
         norm_type = 2.0
         for p in params:
@@ -1944,7 +1944,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         total_dev_norm = get_accelerator().FloatTensor([float(total_norm)])
         dist.all_reduce(total_dev_norm, op=dist.ReduceOp.SUM, group=self.dp_process_group)
 
-        self._model_parallel_all_reduce(tensor=total_dev_norm, op=dist.ReduceOp.SUM)
+        if model_parallel_reduce:
+            self._model_parallel_all_reduce(tensor=total_dev_norm, op=dist.ReduceOp.SUM)
 
         total_norm = total_dev_norm[0].item()**(1. / norm_type)
 
@@ -2645,7 +2646,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         if pg_utils.is_parallel(self.model_parallel_group):
             dist.all_reduce(tensor=tensor, op=op, group=self.model_parallel_group)
 
-    def get_grad_norm_direct(self, gradients, params, norm_type=2):
+    def get_grad_norm_direct(self, gradients, params, norm_type=2, model_parallel_reduce=True):
         """Clips gradient norm of an iterable of parameters.
 
         This is adapted from torch.nn.utils.clip_grad.clip_grad_norm_ and
@@ -2657,6 +2658,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 single Tensor that will have gradients normalized
             norm_type (float or int): type of the used p-norm. Can be ``'inf'`` for
                 infinity norm.
+            model_parallel_reduce (bool): also reduce over the model-parallel group. Callers that
+                reduce several groups' norms at once pass False and do that reduction themselves.
 
         Returns:
             Total norm of the parameters (viewed as a single vector).
@@ -2670,7 +2673,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             dist.all_reduce(total_norm, op=dist.ReduceOp.MAX, group=self.dp_process_group)
 
             # Take max across all GPUs.
-            self._model_parallel_all_reduce(tensor=total_norm, op=dist.ReduceOp.MAX)
+            if model_parallel_reduce:
+                self._model_parallel_all_reduce(tensor=total_norm, op=dist.ReduceOp.MAX)
         else:
             # if dist.get_rank() == 0:
             #    logger.info(f"Total Norm beginning {total_norm}")
@@ -2692,7 +2696,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             # Sum across all model parallel Device.
             dist.all_reduce(total_norm, op=dist.ReduceOp.SUM, group=self.dp_process_group)
 
-            self._model_parallel_all_reduce(tensor=total_norm, op=dist.ReduceOp.SUM)
+            if model_parallel_reduce:
+                self._model_parallel_all_reduce(tensor=total_norm, op=dist.ReduceOp.SUM)
 
             total_norm = total_norm.pow(1. / norm_type)
 
@@ -2942,13 +2947,21 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
     def scaled_global_norm(self, norm_type=2):
         assert norm_type == 2, "only L2 norm supported"
+        # Each group's norm is reduced over its own data-parallel group only. The model-parallel
+        # reduction (across pipeline stages / tensor slices) is done once, on the combined norm:
+        # ranks of that group can hold different numbers of param groups (e.g. MoE expert groups
+        # chunked by size under an uneven pipeline partition), and one collective per group then
+        # pairs up mismatched groups and hangs.
         norm_groups = []
         for i, group in enumerate(self.bit16_groups):
             if self.cpu_offload:
-                norm = self.complete_grad_norm_calculation_for_cpu_offload(self.params_in_partition[i])
+                norm = self.complete_grad_norm_calculation_for_cpu_offload(self.params_in_partition[i],
+                                                                           model_parallel_reduce=False)
                 norm_groups.append(norm)
             else:
-                norm = self.get_grad_norm_direct(self.averaged_gradients[i], self.params_in_partition[i])
+                norm = self.get_grad_norm_direct(self.averaged_gradients[i],
+                                                 self.params_in_partition[i],
+                                                 model_parallel_reduce=False)
                 if self._muon_update_lacks_loss_scale(i):
                     # Leave the -1 an invalid norm is masked to as it is.
                     norm = torch.where(norm >= 0, norm * self.loss_scale, norm)
@@ -2957,7 +2970,12 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         if self.has_moe_layers:
             self._average_expert_grad_norms(norm_groups)
 
-        return combine_grad_norm_groups(norm_groups, norm_type=norm_type)
+        # An invalid group norm makes the local norm inf, and so the reduced norm too.
+        # With CPU offload the group norms live on the CPU; reduce on the device.
+        total_norm = combine_grad_norm_groups(norm_groups, norm_type=norm_type).pow(norm_type)
+        total_norm = total_norm.to(get_accelerator().current_device_name())
+        self._model_parallel_all_reduce(tensor=total_norm, op=dist.ReduceOp.SUM)
+        return total_norm.pow(1. / norm_type).to(self.device)
 
     def get_bit16_param_group(self, group_no):
         bit16_partitions = self.parallel_partitioned_bit16_groups[group_no]
