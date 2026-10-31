@@ -2,12 +2,17 @@
 
 # DeepSpeed Team
 
+import itertools
+import json
+import random
+
 import pytest
 import torch
 import torch.nn as nn
 
 from deepspeed.accelerator import get_accelerator
-from deepspeed.runtime.pipe.planner import (LayerCost, load_costs, model_state_bytes, optimizer_step_bytes, profile_layer, save_costs, saved_activation_bytes, StageMemoryModel)
+from deepspeed.runtime.pipe.planner import (evaluate_partition, LayerCost, load_costs, model_state_bytes, optimizer_step_bytes, pipeline_step_ms, PipelinePlan, profile_layer, save_costs, saved_activation_bytes, search_micro_batch_size, solve_stages, StageMemoryModel)
+from deepspeed.runtime.pipe.planner.solver import _StageCosts
 
 from unit.common import DistributedTest
 
@@ -190,3 +195,159 @@ class TestStageMemoryModel:
         # with more activations in flight the 1F1B phase is the peak again
         many = LayerCost(1, 2, activation_bytes=100, input_bytes=1, state_bytes=100, step_bytes=40)
         assert model.stage_bytes(0, [many] * 3, 0, [embed]) == 350 + 2 * 300
+
+
+def random_layers(rng, n):
+    layers = []
+    for _ in range(n):
+        fwd = rng.uniform(1, 5)
+        act = rng.uniform(1, 4) * GiB
+        layers.append(
+            LayerCost(fwd_ms=fwd,
+                      bwd_ms=2 * fwd,
+                      activation_bytes=act,
+                      input_bytes=act / rng.uniform(5, 20),
+                      state_bytes=rng.uniform(1, 3) * GiB,
+                      transient_bytes=rng.uniform(0, 2) * GiB,
+                      step_bytes=rng.uniform(0, 4) * GiB,
+                      expert_step_bytes=rng.uniform(0, 4) * GiB))
+    return layers
+
+
+def brute_force(layers, num_stages, limit, micro_batches, first=(), last=()):
+    """Every split and, per stage, the fewest checkpointed layers that fit, via the reference memory model."""
+    model = StageMemoryModel(num_stages, micro_batches)
+    n, best = len(layers), None
+    for cuts in itertools.combinations(range(1, n), num_stages - 1):
+        bounds = (0, ) + cuts + (n, )
+        worst = 0.0
+        for s in range(num_stages):
+            chunk = layers[bounds[s]:bounds[s + 1]]
+            extras = (list(first) if s == 0 else []) + (list(last) if s == num_stages - 1 else [])
+            for c in range(len(chunk) + 1):
+                if model.stage_bytes(s, chunk, c, extras) <= limit:
+                    t = sum(e.time_ms() for e in extras) + sum(l.time_ms(i < c) for i, l in enumerate(chunk))
+                    break
+            else:
+                t = float("inf")
+            worst = max(worst, t)
+        best = worst if best is None else min(best, worst)
+    return best
+
+
+class TestSolver:
+
+    @pytest.mark.parametrize("seed", range(12))
+    def test_matches_brute_force(self, seed):
+        rng = random.Random(seed)
+        n, stages, mb = rng.randint(4, 8), rng.randint(2, 4), rng.randint(2, 8)
+        layers = random_layers(rng, n)
+        first = [LayerCost(rng.uniform(1, 4), rng.uniform(2, 8), activation_bytes=GiB, state_bytes=3 * GiB)]
+        last = [LayerCost(rng.uniform(2, 8), rng.uniform(4, 16), activation_bytes=2 * GiB, state_bytes=4 * GiB)]
+        limit = rng.uniform(10, 40) * GiB
+        expected = brute_force(layers, stages, limit, mb, first, last)
+        plan = solve_stages(layers, stages, limit, mb, first_stage_extra=first, last_stage_extra=last)
+        if expected == float("inf"):
+            assert plan is None
+            return
+        assert max(s.time_ms for s in plan) == pytest.approx(expected)
+        assert sum(s.num_layers for s in plan) == n
+        assert all(s.memory_bytes <= limit for s in plan)
+
+    def test_fast_stage_cost_matches_reference_model(self):
+        rng = random.Random(0)
+        layers = random_layers(rng, 6)
+        extra = [LayerCost(1, 2, activation_bytes=GiB, state_bytes=GiB, transient_bytes=3 * GiB)]
+        model = StageMemoryModel(3, 5)
+        cost = _StageCosts(layers, model, float("inf"), extra, extra)
+        for s in range(3):
+            # an infinite budget returns c = 0; check every c through the incremental path
+            for c in range(len(layers) + 1):
+                # the two paths sum in a different order, so allow for rounding at the boundary
+                cost.limit = model.stage_bytes(s, layers, c, cost.extras(s)) * (1 + 1e-9)
+                cost.cache.clear()
+                _, chosen, memory = cost(s, 0, len(layers))
+                assert chosen <= c
+                assert memory == pytest.approx(model.stage_bytes(s, layers, chosen, cost.extras(s)))
+
+    def test_memory_pressure_checkpoints_early_stages_more(self):
+        layers = [LayerCost(1, 2, activation_bytes=GiB, input_bytes=0.01 * GiB, state_bytes=0.5 * GiB)] * 16
+        plan = solve_stages(layers, 4, memory_limit_bytes=8 * GiB, micro_batches=8)
+        ckpt = [s.num_checkpointed for s in plan]
+        # stage 0 holds 4 micro-batches and must recompute; the last stage holds one and need not
+        assert ckpt[0] > 0 and ckpt[-1] == 0
+        assert all(s.memory_bytes <= 8 * GiB for s in plan)
+        # without memory pressure nothing is checkpointed and the split is uniform
+        plan = solve_stages(layers, 4, memory_limit_bytes=1000 * GiB, micro_batches=8)
+        assert [s.num_layers for s in plan] == [4, 4, 4, 4]
+        assert all(s.num_checkpointed == 0 for s in plan)
+
+    def test_optimizer_step_moves_layers_off_a_stage(self):
+        layers = [LayerCost(1, 2, state_bytes=GiB, step_bytes=2 * GiB)] * 8
+        embed = [LayerCost(0, 0, state_bytes=2 * GiB, step_bytes=4 * GiB)]
+        # k layers on stage 0 step at (k + 2) + (2k + 4) GiB, so at most 3 fit in 15 GiB; recomputation cannot help
+        plan = solve_stages(layers, 2, memory_limit_bytes=15 * GiB, micro_batches=4, first_stage_extra=embed)
+        assert [s.num_layers for s in plan] == [3, 5]
+        assert [s.num_checkpointed for s in plan] == [0, 0]
+        # without the step the split would balance time
+        plan = solve_stages([LayerCost(1, 2, state_bytes=GiB)] * 8,
+                            2,
+                            15 * GiB,
+                            4,
+                            first_stage_extra=[LayerCost(0, 0, state_bytes=2 * GiB)])
+        assert [s.num_layers for s in plan] == [4, 4]
+
+    def test_heavy_last_stage_gets_fewer_layers(self):
+        layers = [LayerCost(1, 2)] * 12
+        plan = solve_stages(layers, 3, float("inf"), 4, last_stage_extra=[LayerCost(3, 6)])
+        assert [s.num_layers for s in plan] == [5, 5, 2]
+
+    def test_infeasible(self):
+        layers = [LayerCost(1, 2, state_bytes=10 * GiB)] * 4
+        assert solve_stages(layers, 2, memory_limit_bytes=GiB, micro_batches=2) is None
+
+    def test_search_skips_sizes_that_do_not_divide(self):
+        layers = [LayerCost(1, 2, activation_bytes=GiB, input_bytes=0.1 * GiB)] * 8
+
+        def costs(mbs):
+            return [l.scaled(mbs) for l in layers], [], []
+
+        plan = search_micro_batch_size(costs, [1, 3, 4],
+                                       global_batch_size=32,
+                                       data_parallel_size=2,
+                                       num_stages=2,
+                                       memory_limit_bytes=100 * GiB)
+        # mbs=3 does not divide 32 / 2; with linear costs the smaller micro-batch has the smaller fill/drain
+        # bubble: mbs=1 is 2 * 12 + 15 * 12 = 204 ms, mbs=4 is 2 * 48 + 3 * 48 = 240 ms
+        assert plan.micro_batch_size == 1 and plan.micro_batches == 16
+        assert plan.step_ms == pytest.approx(204.0)
+        assert pipeline_step_ms([48.0, 48.0], 4) == pytest.approx(240.0)
+
+    def test_evaluate_partition(self):
+        layers = [LayerCost(1, 2, activation_bytes=GiB, input_bytes=0.0)] * 4
+        stages = evaluate_partition(layers, [2, 2], [2, 0], micro_batches=4)
+        assert [s.time_ms for s in stages] == [8.0, 6.0]
+        assert stages[0].memory_bytes == pytest.approx(GiB)  # only the recomputed layer
+        assert stages[1].memory_bytes == pytest.approx(2 * GiB)  # 1F1B: last stage holds one micro-batch
+
+
+class TestPlanFile:
+
+    def test_round_trip(self, tmp_path):
+        layers = [LayerCost(1, 2, activation_bytes=GiB, input_bytes=0.01 * GiB)] * 8
+        stages = solve_stages(layers, 2, memory_limit_bytes=3 * GiB, micro_batches=4)
+        plan = PipelinePlan(stages=stages, micro_batches=4, partition_layer_type="Block")
+        path = tmp_path / "plan.json"
+        plan.save(path)
+        loaded = PipelinePlan.load(path)
+        assert loaded.layers_per_stage == plan.layers_per_stage
+        assert loaded.checkpoint_layers_per_stage == plan.checkpoint_layers_per_stage
+        assert loaded.partition_method == "custom:" + ",".join(map(str, plan.layers_per_stage))
+        assert loaded.partition_layer_type == "Block"
+
+    def test_hand_written_plan(self, tmp_path):
+        path = tmp_path / "plan.json"
+        path.write_text(json.dumps({"layers_per_stage": [3, 5], "checkpoint_layers_per_stage": [2, 0]}))
+        plan = PipelinePlan.load(path)
+        assert plan.partition_method == "custom:3,5"
+        assert plan.checkpoint_layers_per_stage == [2, 0]
