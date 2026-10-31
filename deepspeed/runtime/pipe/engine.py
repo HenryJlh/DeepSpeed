@@ -760,6 +760,9 @@ class PipelineEngine(DeepSpeedEngine):
                 self.loss = outputs
             if self.eval_return_logits:
                 self.outputs = outputs
+            # Nothing reads the last stage's outputs (e.g. the logits) after the loss: its backward starts
+            # from the loss, and eval_batch(return_logits=True) uses self.outputs.
+            self.pipe_buffers['outputs'][buffer_id] = None
 
             if isinstance(self.loss, torch.Tensor):
                 self.fwd_outputs.append(self.loss.detach())
