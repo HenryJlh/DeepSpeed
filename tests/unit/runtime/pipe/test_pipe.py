@@ -4,6 +4,8 @@
 # DeepSpeed Team
 
 import copy
+import gc
+import weakref
 import torch.nn as nn
 import pytest
 
@@ -86,6 +88,57 @@ class TestPipeGradientAccumulationScaling(DistributedTest):
         expected_weight = torch.tensor([[1.0 - 2.0 * learning_rate]], device=engine.device)
         actual_weight = next(engine.module.parameters())
         assert torch.allclose(actual_weight, expected_weight)
+
+
+class TestPipeLastStageOutputs(DistributedTest):
+    world_size = 2
+    micro_batches = 4
+
+    def engine(self):
+        config = {
+            "train_batch_size": self.micro_batches,
+            "train_micro_batch_size_per_gpu": 1,
+            "gradient_accumulation_steps": self.micro_batches,
+            "optimizer": {
+                "type": "SGD",
+                "params": {
+                    "lr": 0.1
+                }
+            },
+            "zero_allow_untested_optimizer": True,
+        }
+        torch.manual_seed(0)
+        model = PipelineModule(layers=[nn.Linear(4, 4), nn.Linear(4, 8)], num_stages=2, loss_fn=nn.CrossEntropyLoss())
+        engine, _, _, _ = deepspeed.initialize(config=config, model=model, model_parameters=model.parameters())
+        return engine, RepeatingLoader([(torch.randn(1, 4), torch.tensor([1]))])
+
+    def test_outputs_are_not_kept_for_the_backward(self):
+        engine, data = self.engine()
+        # The last stage's outputs (the logits of a language model) are only needed to compute the loss.
+        # They used to stay referenced in the stage's pipe buffers through the backward and until a later
+        # micro-batch reused the buffer.
+        outputs, alive_in_backward = [], []
+        if engine.is_last_stage():
+            head = engine.module.forward_funcs[-1]
+            head.register_forward_hook(lambda module, inputs, output: outputs.append(weakref.ref(output)))
+            # called during the head's backward, i.e. while the micro-batch's loss is being backpropagated
+            head.weight.register_hook(lambda grad: alive_in_backward.append(outputs[-1]() is not None))
+
+        engine.train_batch(iter(data))
+        gc.collect()
+
+        if engine.is_last_stage():
+            assert alive_in_backward == [False] * self.micro_batches
+            assert len(outputs) == self.micro_batches and all(ref() is None for ref in outputs)
+
+    def test_eval_still_returns_logits(self):
+        engine, data = self.engine()
+        loss, logits = engine.eval_batch(iter(data), return_logits=True)
+        if engine.is_last_stage():
+            # every micro-batch is the same sample, so the mean loss is the loss of the returned logits
+            assert torch.allclose(loss, nn.functional.cross_entropy(logits, torch.tensor([1], device=logits.device)))
+        else:
+            assert logits is None
 
 
 @pytest.mark.parametrize('topo_config', [
