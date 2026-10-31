@@ -282,6 +282,36 @@ by DeepSpeed:
   ```
   Every stage needs at least one counted layer.
 
+### Per-Stage Activation Checkpointing
+`activation_checkpoint_interval` recomputes the same share of layers on every
+stage. Under the 1F1B schedule, however, stage `s` of `P` keeps up to `P - s`
+micro-batches of activations alive, so the first stages run out of memory long
+before the last ones, and recomputing on every stage wastes time where memory
+is not short. `checkpoint_layers_per_stage` sets the number of recomputed
+layers for each stage separately:
+
+```python
+net = PipelineModule(layers=specs, num_stages=4,
+                     partition_method="custom:7,9,9,7",
+                     partition_layer_type="TransformerLayer",
+                     checkpoint_layers_per_stage=[5, 3, 0, 0])
+```
+
+Stage `s` recomputes its first `checkpoint_layers_per_stage[s]` counted layers
+(see `partition_layer_type`; without it every layer counts) and no others.
+Layers excluded by `checkpointable_layers` are never recomputed. Consecutive
+recomputed layers are recomputed together, at most
+`activation_checkpoint_interval` of them per call; an interval of 0 is raised
+to 1. The option works with every partition method and with `DualPipeVModule`,
+where the list has one entry per virtual stage (`2P` entries). It can also be
+set in the DeepSpeed config, where it overrides the `PipelineModule` argument:
+
+```json
+"pipeline": {
+  "checkpoint_layers_per_stage": [5, 3, 0, 0]
+}
+```
+
 ### Memory-Efficient Model Construction
 Building a `Sequential` container and providing it to a `PipelineModule` is a convenient way
 of specifying a pipeline parallel model. However, this approach encounters scalability issues

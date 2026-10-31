@@ -1389,6 +1389,18 @@ The asynchronous side-stream copy matches the peak-memory reduction of a blockin
 | --------------------------------------------------------------- | ------- |
 | Logs the forward and backward time for each checkpoint function | `false` |
 
+### Pipeline Parallelism
+```json
+  "pipeline": {
+    "checkpoint_layers_per_stage": [5, 3, 0, 0]
+  }
+```
+<i>**checkpoint_layers_per_stage**</i>: [list of integers]
+
+| Description                                                                                                                                                                                                                                                                                    | Default |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
+| Activation checkpointing per pipeline stage for a `PipelineModule`: stage `s` recomputes its first `checkpoint_layers_per_stage[s]` layers counted by `partition_layer_type` and no others. One entry per stage (per virtual stage for `DualPipeVModule`). Overrides the `PipelineModule` argument of the same name. | `null`  |
+
 ### Data Efficiency
 DeepSpeed Data Efficiency Library includes two techniques: curriculum learning and random layerwise token dropping (random-LTD). Read more about how to use the DeepSpeed Data Efficiency Library in our [tutorial](/tutorials/data-efficiency/).
 

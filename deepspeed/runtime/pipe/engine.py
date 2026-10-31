@@ -216,6 +216,8 @@ class PipelineEngine(DeepSpeedEngine):
                 logger.info('CONFIG: activation_checkpoint_func=non_reentrant_checkpoint')
         if self._config.pipeline['activation_checkpoint_interval'] > 0:
             self.module.activation_checkpoint_interval = self._config.pipeline['activation_checkpoint_interval']
+        if self._config.pipeline.get('checkpoint_layers_per_stage') is not None:
+            self.module.set_checkpoint_layers_per_stage(self._config.pipeline['checkpoint_layers_per_stage'])
         if self.module.activation_checkpoint_interval > 0:
             self.module._precompute_checkpointable_values()
 

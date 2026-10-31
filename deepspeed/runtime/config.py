@@ -276,6 +276,7 @@ def get_pipeline_config(param_dict):
         "partition": "best",
         "seed_layers": False,
         "activation_checkpoint_interval": 0,
+        "checkpoint_layers_per_stage": None,
         "pipe_partitioned": True,
         "grad_partitioned": True,
     }

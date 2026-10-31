@@ -52,6 +52,7 @@ class DualPipeVModule(PipelineModule):
     def _build(self):
         self.phase_funcs = []
         self.phase_checkpointable = [[], []]
+        self.phase_checkpoint_bounds = [[], []]
         for start, stop in self.phase_bounds:
             self._set_bounds(start, stop)
             super()._build()
@@ -64,6 +65,7 @@ class DualPipeVModule(PipelineModule):
         self.active_phase = phase
         self.forward_funcs = self.phase_funcs[phase]
         self.is_checkpointable_results = self.phase_checkpointable[phase]
+        self.checkpoint_segment_bounds = self.phase_checkpoint_bounds[phase]
         self._local_start, self._local_stop = self.phase_bounds[phase]
 
     def _precompute_checkpointable_values(self):
@@ -74,6 +76,7 @@ class DualPipeVModule(PipelineModule):
             self.is_checkpointable_results_interval = None
             super()._precompute_checkpointable_values()
             self.phase_checkpointable[phase] = self.is_checkpointable_results
+            self.phase_checkpoint_bounds[phase] = self.checkpoint_segment_bounds
 
     def save_state_dict(self, *args, **kwargs):
         for phase in (0, 1):
