@@ -22,8 +22,11 @@ def layer_transient_bytes(layer, checkpointed):
 def step_peak_bytes(states, layers):
     """Peak of the optimizer step: model states plus the largest parameter group's step memory.
 
-    A stage's dense parameters form one optimizer group and its expert parameters another, and the
-    step processes one group at a time. Activations are freed by then.
+    The step runs after the last backward, when activations are freed, and processes one parameter
+    group at a time. A stage's dense parameters are taken as one group and its expert parameters as
+    another. This is an upper bound: groups stepped later find earlier groups' gradients freed, and
+    splitting the parameters into more groups (e.g. by weight decay, or the default chunking of MoE
+    expert groups) makes each group smaller.
     """
     dense = sum(l.step_bytes for l in layers)
     expert = sum(l.expert_step_bytes for l in layers)
