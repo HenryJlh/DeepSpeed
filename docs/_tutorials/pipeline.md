@@ -268,6 +268,19 @@ by DeepSpeed:
   is not case sensitive. For example, `partition_method="type:transformer"`
   would balance the number of transformer layers per stage.
 * `partition_method="uniform"` balances the number of layers per stage.
+* `partition_method="custom:n_0,n_1,..."` places exactly `n_s` layers on
+  stage `s`, for example a partition computed offline or tuned by hand. With
+  `partition_layer_type="[regex]"` only layers whose class names match are
+  counted (matched as in `type:`); every other layer stays on the stage of the
+  counted layer before it, and layers before the first counted one go to the
+  first stage. For a GPT model with an embedding, 32 transformer layers and a
+  final norm and head:
+  ```python
+  net = PipelineModule(layers=specs, num_stages=4,
+                       partition_method="custom:7,9,9,7",
+                       partition_layer_type="TransformerLayer")
+  ```
+  Every stage needs at least one counted layer.
 
 ### Memory-Efficient Model Construction
 Building a `Sequential` container and providing it to a `PipelineModule` is a convenient way

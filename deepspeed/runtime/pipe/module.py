@@ -114,12 +114,17 @@ class PipelineModule(nn.Module):
         seed_fn(type, optional): The custom seed generating function. Defaults to random seed generator.
         base_seed (int, optional): The starting seed. Defaults to 1234.
         partition_method (str, optional): The method upon which the layers are partitioned. Defaults to 'parameters'.
+            ``'custom:n_0,n_1,...'`` gives stage ``s`` exactly ``n_s`` partitionable layers (see ``partition_layer_type``).
         activation_checkpoint_interval (int, optional): The granularity activation checkpointing in terms of number of layers. 0 disables activation checkpointing.
         activation_checkpoint_func (callable, optional): The function to use for activation checkpointing. Defaults to ``deepspeed.checkpointing.checkpoint``.
         checkpointable_layers (list[str], optional): List of layer class names that are eligible for checkpointing. For GPT models,
             ParallelTransformerLayerPipe is always checkpointed regardless of this list. If None, all layers with parameters are
             considered checkpointable. Defaults to None.
         dynamic_shape: Allows dynamic shapes of inputs. This might have a performance impact.
+        partition_layer_type (str, optional): Regex over layer class names, matched as in ``'type:'``, that selects the
+            layers counted by ``'custom:'`` partitioning. A layer it does not match stays on the stage of the
+            partitionable layer before it; leading ones go to the first stage. Defaults to None, which counts every
+            layer.
     """
 
     def __init__(self,
@@ -134,7 +139,8 @@ class PipelineModule(nn.Module):
                  activation_checkpoint_interval=0,
                  activation_checkpoint_func=checkpointing.checkpoint,
                  checkpointable_layers=None,
-                 dynamic_shape=False):
+                 dynamic_shape=False,
+                 partition_layer_type=None):
 
         super().__init__()
 
@@ -189,6 +195,9 @@ class PipelineModule(nn.Module):
         self._num_layers = len(self._layer_specs)
         self._local_start = 0
         self._local_stop = None
+        self.partition_layer_type = partition_layer_type
+        self._partitionable_idxs = (self._find_layer_type(partition_layer_type)
+                                    if partition_layer_type is not None else list(range(self._num_layers)))
         self._partition_layers(method=partition_method)
 
         self.forward_funcs = []
@@ -415,6 +424,8 @@ class PipelineModule(nn.Module):
             for idx in self._find_layer_type(layertype):
                 binary_weights[idx] = 1
             self.parts = ds_utils.partition_balanced(weights=binary_weights, num_parts=num_stages)
+        elif method.startswith('custom:'):
+            self.parts = self._partition_custom(method.split(':', 1)[1])
         elif method == 'profile':
             raise NotImplementedError(f'Partitioning method {method} not implemented.')
         else:
@@ -445,6 +456,28 @@ class PipelineModule(nn.Module):
                     print(f'  loss: {self.loss_fn.__class__.__name__}')
 
         self._set_bounds(start=self.parts[stage_id], stop=self.parts[stage_id + 1])
+
+    def _partition_custom(self, counts_str):
+        """Stage ``s`` gets ``counts[s]`` partitionable layers; each stage starts at its first one."""
+        try:
+            counts = [int(c) for c in counts_str.split(',')]
+        except ValueError:
+            raise ValueError(f"partition_method 'custom:{counts_str}' must be a comma-separated list of ints")
+        idxs = self._partitionable_idxs
+        if len(counts) != self.num_stages:
+            raise ValueError(f"partition_method 'custom:{counts_str}' has {len(counts)} entries for "
+                             f"{self.num_stages} stages")
+        if any(c < 1 for c in counts):
+            raise ValueError(f"partition_method 'custom:{counts_str}': every stage needs at least one layer")
+        if sum(counts) != len(idxs):
+            raise ValueError(f"partition_method 'custom:{counts_str}' assigns {sum(counts)} layers, but there are "
+                             f"{len(idxs)} partitionable layers")
+        parts, offset = [0], 0
+        for count in counts[:-1]:
+            offset += count
+            parts.append(idxs[offset])
+        parts.append(self._num_layers)
+        return parts
 
     @staticmethod
     def _recursive_getattr(module: torch.nn.Module, attr_name: str) -> torch.Tensor:
