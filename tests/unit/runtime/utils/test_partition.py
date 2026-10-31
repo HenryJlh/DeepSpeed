@@ -152,6 +152,8 @@ def test_int_balanced():
     P = 4
     parts = partition_balanced(weights, P)
     assert parts == [0, 3, 4, 5, 6]
+    # Python ints, not numpy integers: PipelineModule(seed_layers=True) passes them to random.seed()
+    assert all(type(p) is int for p in parts)
 
     assert_valid_partition(weights, parts, P)
     costs = get_partition_weights(weights, parts)

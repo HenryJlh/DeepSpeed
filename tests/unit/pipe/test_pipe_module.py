@@ -122,6 +122,22 @@ class TestPipeModuleSequential(DistributedTest):
         assert torch.allclose(base_output, pipe_output, atol=1e-4)
 
 
+class TestPipeModuleSeedLayers(DistributedTest):
+    world_size = 2
+
+    @pytest.mark.parametrize("partition_method", ["uniform", "parameters", "type:Linear"])
+    def test_layers_are_seeded_by_their_index(self, partition_method):
+        from deepspeed.pipe import LayerSpec
+        from deepspeed.runtime.utils import set_random_seed
+        specs = [LayerSpec(nn.Linear, HIDDEN_DIM, HIDDEN_DIM) for _ in range(LAYERS)] + [LayerSpec(nn.ReLU)]
+        model = PipelineModule(layers=specs, num_stages=2, seed_layers=True, partition_method=partition_method)
+        # every layer is built right after seeding with base_seed + its global index, whatever the partition
+        for local_idx, layer in enumerate(model.forward_funcs):
+            if isinstance(layer, nn.Linear):
+                set_random_seed(model.base_seed + model._local_start + local_idx)
+                assert torch.equal(layer.weight, nn.Linear(HIDDEN_DIM, HIDDEN_DIM).weight)
+
+
 class TestPipeModuleCheckpointInterval(DistributedTest):
     world_size = 1
 
