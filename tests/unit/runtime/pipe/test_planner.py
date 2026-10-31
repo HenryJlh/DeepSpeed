@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 
 from deepspeed.accelerator import get_accelerator
-from deepspeed.runtime.pipe.planner import (LayerCost, load_costs, model_state_bytes, optimizer_step_bytes, profile_layer, save_costs, saved_activation_bytes)
+from deepspeed.runtime.pipe.planner import (LayerCost, load_costs, model_state_bytes, optimizer_step_bytes, profile_layer, save_costs, saved_activation_bytes, StageMemoryModel)
 
 from unit.common import DistributedTest
 
@@ -153,3 +153,40 @@ class TestProfileLayer(DistributedTest):
         cost = profile_layer(head, (torch.randn(tokens, 64, device=device), ), warmup=1, iters=1)
         # the fp32 logits gradient exists only during the backward
         assert cost.transient_bytes >= tokens * vocab * 4
+
+
+class TestStageMemoryModel:
+
+    def test_inflight_follows_1f1b(self):
+        layer = [LayerCost(1, 2, activation_bytes=10, input_bytes=1)]
+        model = StageMemoryModel(num_stages=4, micro_batches=8)
+        assert [model.stage_bytes(s, layer, 0) for s in range(4)] == [40, 30, 20, 10]
+        # never more in flight than there are micro-batches
+        assert StageMemoryModel(num_stages=4, micro_batches=2).stage_bytes(0, layer, 0) == 20
+
+    def test_terms(self):
+        block = LayerCost(1, 2, activation_bytes=10, input_bytes=1, state_bytes=100, transient_bytes=3)
+        head = LayerCost(1, 2, activation_bytes=20, state_bytes=50, transient_bytes=40)
+        model = StageMemoryModel(num_stages=2, micro_batches=4)
+        # stage 0 keeps 2 micro-batches; only one layer's backward transient is live at a time
+        assert model.stage_bytes(0, [block] * 3, 0) == 300 + 2 * 30 + 3
+        # a checkpointed layer keeps its input and rebuilds its activations during its backward
+        assert model.stage_bytes(0, [block] * 3, 2) == 300 + 2 * (1 + 1 + 10) + (3 + 10)
+        # the last stage keeps one micro-batch, and the head's logits gradient is the largest transient
+        assert model.stage_bytes(1, [block], 0, [head]) == 150 + (10 + 20) + 40
+
+    def test_optimizer_step_can_be_the_peak(self):
+        block = LayerCost(1,
+                          2,
+                          activation_bytes=10,
+                          input_bytes=1,
+                          state_bytes=100,
+                          step_bytes=40,
+                          expert_step_bytes=30)
+        embed = LayerCost(1, 2, state_bytes=50, step_bytes=20)
+        model = StageMemoryModel(num_stages=2, micro_batches=4)
+        # the dense group (3 x 40 + 20) is stepped apart from the expert group (3 x 30); activations are gone
+        assert model.stage_bytes(0, [block] * 3, 0, [embed]) == 350 + 140
+        # with more activations in flight the 1F1B phase is the peak again
+        many = LayerCost(1, 2, activation_bytes=100, input_bytes=1, state_bytes=100, step_bytes=40)
+        assert model.stage_bytes(0, [many] * 3, 0, [embed]) == 350 + 2 * 300
