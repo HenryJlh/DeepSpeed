@@ -312,6 +312,9 @@ set in the DeepSpeed config, where it overrides the `PipelineModule` argument:
 }
 ```
 
+The [memory-aware pipeline partitioning](/tutorials/pipeline-planner/) tutorial
+shows how to choose both lists from measured layer costs and a memory budget.
+
 ### Memory-Efficient Model Construction
 Building a `Sequential` container and providing it to a `PipelineModule` is a convenient way
 of specifying a pipeline parallel model. However, this approach encounters scalability issues

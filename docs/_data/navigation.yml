@@ -101,6 +101,8 @@ lnav:
         url: /tutorials/one-cycle/
       - title: 'Pipeline Parallelism'
         url: /tutorials/pipeline/
+      - title: 'Memory-Aware Pipeline Partitioning'
+        url: /tutorials/pipeline-planner/
       - title: 'Transformer Kernel'
         url: /tutorials/transformer_kernel/
       - title: 'Arctic Long Sequence Training (ALST) for HF Transformers integration'
