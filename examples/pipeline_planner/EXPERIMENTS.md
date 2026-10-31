@@ -16,7 +16,35 @@ python -c "import deepspeed; print(deepspeed.__file__)"   # 确认导入的是�
 
 只需要 PyTorch 和 DeepSpeed 本身的依赖，不需要 Megatron 或 X-MoE。
 
-## 2. 三步
+## 2. 一键运行（推荐）
+
+`run_experiment.sh` 会依次完成 profile、规划、按 plan 训练、用 DeepSpeed 默认切分跑对照、逐个 stage 对比显存。所有设置都通过环境变量给出，完整说明见脚本开头的注释。
+
+```bash
+cd examples/pipeline_planner
+bash run_experiment.sh                                              # 默认：MoE，单节点 4 卡，PP4
+MODEL=dense PP=4 bash run_experiment.sh                             # dense 7.5B
+MODEL=moe PP=2 EP=2 bash run_experiment.sh                          # 4 卡：PP2 × DP2 × EP2
+NUM_NODES=2 GPUS_PER_NODE=8 HOSTFILE=hosts PP=4 EP=4 bash run_experiment.sh    # 2 节点 16 卡：PP4 × DP4 × EP4
+ALLOC=expandable_segments:True bash run_experiment.sh               # NVIDIA 上减少显存碎片（AMD 上用 max_split_size_mb:512）
+MODEL=custom MODEL_ARGS="--layers 48 --hidden 4096 --seq 8192 --experts 16 --ffn 8192" bash run_experiment.sh
+```
+
+脚本会自动完成这些事：
+- 由总卡数和 PP 算出 DP，由 MBS、GAS、DP 算出 global batch；
+- 生成对应的 `ds_config.json`；
+- 从 0 号卡读出每卡显存，也可以用 `MEM_GB` 指定。
+
+结果都在 `runs/<模型>_pp<PP>_dp<DP>_ep<EP>/` 下：
+- `summary.txt`：汇总，包括规划器的输出、各次训练每个 stage 的步时和显存、预测与实测的对比；
+- `costs.json`、`plan.json`；
+- 各步骤的完整日志。
+
+把整个目录发回来即可。
+
+多节点时，脚本本身在其中一个节点上运行；profile 只用这个节点上的 EP 张卡，训练通过 `HOSTFILE` 用 DeepSpeed launcher 拉起所有节点。如果集群只能用 srun 启动，按下面第 3 节的单步命令自己替换启动方式。
+
+## 3. 单步运行
 
 以下命令都在 `examples/pipeline_planner/` 目录下执行。`$M` 是模型参数，见 `model.py` 的 `add_model_args`，例如：
 
@@ -47,7 +75,7 @@ M="--layers 32 --hidden 2048 --seq 8192 --vocab 128000 --experts 8 --ffn 4096"
    - 总卡数 = PP × DP，EP 必须能整除 DP。
    - `ds_config.json` 里的 `gradient_accumulation_steps` 就是每步的 micro-batch 数；和 plan 不一致时 engine 会打警告。
 
-## 3. 注意事项
+## 4. 注意事项
 
 - **显存碎片**：如果预测没超、实际却 OOM，报错里 "reserved but unallocated" 有好几 GiB，就是碎片导致的。
   - NVIDIA：设 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`（新版 PyTorch 用 `PYTORCH_ALLOC_CONF`）。
@@ -56,14 +84,16 @@ M="--layers 32 --hidden 2048 --seq 8192 --vocab 128000 --experts 8 --ffn 4096"
 - **适用范围**：显存模型只对 bf16 + ZeRO-1 + Adam 成立。示例的 `ds_config.json` 就是这个配置。
 - **每个 stage 的输出**：`train.py` 训练 2 步热身加 5 步计时，每个 stage 打印一行：平均步时、峰值 allocated 和 reserved 显存、loss。
 
-## 4. 请发回的结果
+## 5. 请发回的结果
+
+用 `run_experiment.sh` 时，把 `runs/` 下对应的整个目录发回来，再附上 GPU 型号、节点数和 PyTorch / CUDA 或 ROCm 版本即可。单步运行时请发回：
 
 1. 硬件和软件：GPU 型号和显存、节点数、PyTorch / CUDA 或 ROCm 版本，以及 `deepspeed.__file__` 那一行的输出；
-2. `costs.json`、`plan.json`、规划器的完整输出（第 2 步打印的内容）；
+2. `costs.json`、`plan.json`、规划器的完整输出（单步运行第 2 步打印的内容）；
 3. `train_plan.log`、`train_base.log`（至少包含每个 stage 的 `stage N:` 那几行）和 `compare.py` 的输出；
 4. 如果出现 OOM：报错里 "Tried to allocate ... reserved but unallocated" 的那一段。
 
-## 5. 在 4×MI210（PP4 × DP1）上已有的结果，供对照
+## 6. 在 4×MI210 上已有的结果，供对照
 
 | 模型 | plan | `parameters` 不重算 | `parameters` 全重算 | 显存预测误差 |
 |---|---|---|---|---|
