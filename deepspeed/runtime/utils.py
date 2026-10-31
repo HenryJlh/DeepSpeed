@@ -666,7 +666,9 @@ def partition_balanced(weights, num_parts):
 
     parts = [n]
     for i in reversed(range(1, m + 1)):
-        parts.append(position[parts[-1], i])
+        # Python ints, as partition_uniform returns: callers seed with these offsets, and random.seed()
+        # rejects numpy integers
+        parts.append(int(position[parts[-1], i]))
     parts.reverse()
 
     return parts
