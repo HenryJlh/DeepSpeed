@@ -108,6 +108,72 @@ class TestCustomPartitionTwoStages(DistributedTest):
         assert stage_layer_types(model) == ["Block", "LayerNorm", "Block", "LayerNorm"]
 
 
+class TestProfilePlan(DistributedTest):
+    world_size = 2
+
+    def write_plan(self, tmpdir):
+        from deepspeed.runtime.pipe.planner import PipelinePlan, StagePlan
+        plan = PipelinePlan(stages=[StagePlan(0, 3, 2, 0.0, 0.0),
+                                    StagePlan(1, 5, 0, 0.0, 0.0)],
+                            partition_layer_type="Block")
+        path = f"{tmpdir}/plan_rank{dist.get_rank()}.json"
+        plan.save(path)
+        return path
+
+    def test_plan_sets_partition_and_checkpointing(self, tmpdir):
+        model = PipelineModule(layers=gpt_like_layers(),
+                               num_stages=2,
+                               partition_method=f"profile:{self.write_plan(tmpdir)}")
+        assert model.parts == [0, 5, 13]
+        assert model.partition_layer_type == "Block"
+        assert model.checkpoint_layers_per_stage == [2, 0]
+
+    def test_arguments_override_the_plan(self, tmpdir):
+        model = PipelineModule(layers=gpt_like_layers(),
+                               num_stages=2,
+                               partition_method=f"profile:{self.write_plan(tmpdir)}",
+                               checkpoint_layers_per_stage=[1, 1])
+        assert model.checkpoint_layers_per_stage == [1, 1]
+
+    @pytest.mark.parametrize("micro_batches,warns", [(4, False), (2, True)])
+    def test_engine_warns_about_other_micro_batches(self, tmpdir, micro_batches, warns):
+        import logging
+        from deepspeed.utils import logger as ds_logger
+        from deepspeed.runtime.pipe.planner import PipelinePlan, StagePlan
+        path = f"{tmpdir}/plan_rank{dist.get_rank()}.json"
+        PipelinePlan(stages=[StagePlan(0, 3, 0, 0.0, 0.0), StagePlan(1, 5, 0, 0.0, 0.0)],
+                     micro_batch_size=1,
+                     micro_batches=4,
+                     partition_layer_type="Block").save(path)
+        model = PipelineModule(layers=gpt_like_layers(),
+                               num_stages=2,
+                               loss_fn=nn.MSELoss(),
+                               partition_method=f"profile:{path}")
+        config = {
+            "train_batch_size": micro_batches,
+            "train_micro_batch_size_per_gpu": 1,
+            "optimizer": {
+                "type": "Adam",
+                "params": {
+                    "lr": 0.01
+                }
+            },
+        }
+        records = []
+        handler = logging.Handler(level=logging.WARNING)
+        handler.emit = records.append
+        ds_logger.addHandler(handler)
+        try:
+            deepspeed.initialize(config=config, model=model, model_parameters=[p for p in model.parameters()])
+        finally:
+            ds_logger.removeHandler(handler)
+        assert any("pipeline plan was made for 4 micro-batches" in r.getMessage() for r in records) == warns
+
+    def test_profile_without_plan_explains(self):
+        with pytest.raises(NotImplementedError, match="deepspeed.runtime.pipe.planner"):
+            PipelineModule(layers=gpt_like_layers(), num_stages=2, partition_method="profile")
+
+
 class TestSelectiveCheckpointing(DistributedTest):
     world_size = 4
 

@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
-"""Memory-aware pipeline partitioning.
+"""Memory-aware pipeline partitioning (``PipelineModule(partition_method="profile:<plan.json>")``).
 
 Measure each distinct layer with :func:`profile_layer`, write the costs with :func:`save_costs`,
-and plan with :func:`search_micro_batch_size`. The plan sets both the layers per stage and how
-many of them each stage checkpoints.
+plan with ``python -m deepspeed.runtime.pipe.planner`` (or :func:`search_micro_batch_size`), and
+pass the plan's path to ``PipelineModule``. The plan sets both the layers per stage and how many of
+them each stage checkpoints.
 """
 
 from .cost import LayerCost, model_state_bytes, optimizer_step_bytes, save_costs, load_costs

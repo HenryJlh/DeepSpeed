@@ -220,6 +220,14 @@ class PipelineEngine(DeepSpeedEngine):
             self.module.set_checkpoint_layers_per_stage(self._config.pipeline['checkpoint_layers_per_stage'])
         if self.module.activation_checkpoint_interval > 0:
             self.module._precompute_checkpointable_values()
+        plan = getattr(self.module, 'pipeline_plan', None)
+        if plan is not None and plan.micro_batch_size is not None:
+            # the plan's memory predictions hold only for the micro-batches it was made for
+            planned = (plan.micro_batch_size, plan.micro_batches)
+            if planned != (self.micro_batch_size, self.micro_batches):
+                logger.warning(f'pipeline plan was made for {plan.micro_batches} micro-batches of size '
+                               f'{plan.micro_batch_size}, but this engine runs {self.micro_batches} of size '
+                               f'{self.micro_batch_size}; its stages may not fit in memory')
 
         self.module.checkpoint_parallel_write_pipeline = self._config.checkpoint_parallel_write_pipeline
 

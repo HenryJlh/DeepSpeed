@@ -79,8 +79,8 @@ class PipelinePlan:
                 for i, (n, c) in enumerate(zip(d["layers_per_stage"], d["checkpoint_layers_per_stage"]))
             ]
         return cls(stages=stages,
-                   micro_batch_size=d.get("micro_batch_size", 1),
-                   micro_batches=d.get("micro_batches", 1),
+                   micro_batch_size=d.get("micro_batch_size"),
+                   micro_batches=d.get("micro_batches"),
                    step_ms=d.get("predicted_step_ms", 0.0),
                    partition_layer_type=d.get("partition_layer_type"),
                    notes=d.get("notes", {}))

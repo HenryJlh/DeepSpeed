@@ -11,7 +11,10 @@ import torch
 import torch.nn as nn
 
 from deepspeed.accelerator import get_accelerator
-from deepspeed.runtime.pipe.planner import (evaluate_partition, LayerCost, load_costs, model_state_bytes, optimizer_step_bytes, pipeline_step_ms, PipelinePlan, profile_layer, save_costs, saved_activation_bytes, search_micro_batch_size, solve_stages, StageMemoryModel)
+from deepspeed.runtime.pipe.planner import (LayerCost, PipelinePlan, StageMemoryModel, evaluate_partition, load_costs,
+                                            model_state_bytes, optimizer_step_bytes, pipeline_step_ms, profile_layer,
+                                            save_costs, saved_activation_bytes, search_micro_batch_size, solve_stages)
+from deepspeed.runtime.pipe.planner.__main__ import main as planner_main
 from deepspeed.runtime.pipe.planner.solver import _StageCosts
 
 from unit.common import DistributedTest
@@ -351,3 +354,37 @@ class TestPlanFile:
         plan = PipelinePlan.load(path)
         assert plan.partition_method == "custom:3,5"
         assert plan.checkpoint_layers_per_stage == [2, 0]
+
+
+class TestCommandLine:
+
+    def costs(self, tmp_path):
+        dense = LayerCost(1.0, 2.0, activation_bytes=GiB, input_bytes=0.05 * GiB, state_bytes=0.2 * GiB)
+        moe = LayerCost(2.5, 5.0, activation_bytes=2 * GiB, input_bytes=0.05 * GiB, state_bytes=GiB)
+        head = LayerCost(4.0, 8.0, activation_bytes=2 * GiB, state_bytes=2 * GiB)
+        path = tmp_path / "costs.json"
+        save_costs(path, {"dense": dense, "moe": moe}, ["dense"] * 2 + ["moe"] * 10, last_stage_extra=[head])
+        return str(path)
+
+    def test_plan(self, tmp_path, capsys):
+        ppath = tmp_path / "plan.json"
+        args = ["--costs", self.costs(tmp_path), "--stages", "4", "--global-batch-size", "32", "--dp", "2"]
+        assert planner_main(
+            args +
+            ["--memory-gb", "16", "--micro-batch-sizes", "1,2", "--partition-layer-type", "Block", "-o",
+             str(ppath)]) == 0
+        out = capsys.readouterr().out
+        assert "uniform, full checkpointing" in out
+        plan = PipelinePlan.load(ppath)
+        assert sum(plan.layers_per_stage) == 12 and plan.partition_layer_type == "Block"
+        # the default headroom keeps every stage under 90 % of the device memory
+        assert plan.notes["headroom_gb"] == pytest.approx(1.6)
+        assert all(s.memory_bytes <= 14.4 * GiB for s in plan.stages)
+
+    def test_headroom_is_left_out_of_the_budget(self, tmp_path):
+        ppath = tmp_path / "plan.json"
+        args = ["--costs", self.costs(tmp_path), "--stages", "4", "--global-batch-size", "8", "-o", str(ppath)]
+        assert planner_main(args + ["--memory-gb", "16", "--headroom-gb", "4"]) == 0
+        assert max(s.memory_bytes for s in PipelinePlan.load(ppath).stages) <= 12 * GiB
+        # 1 GiB is left, less than the head's states alone
+        assert planner_main(args + ["--memory-gb", "16", "--headroom-gb", "15"]) == 1
