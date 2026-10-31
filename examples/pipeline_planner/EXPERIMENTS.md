@@ -97,7 +97,10 @@ M="--layers 32 --hidden 2048 --seq 8192 --vocab 128000 --experts 8 --ffn 4096"
 
 | 模型 | plan | `parameters` 不重算 | `parameters` 全重算 | 显存预测误差 |
 |---|---|---|---|---|
-| dense 7.5B，seq 4096 | 9.96 s | 10.18 s | 12.72 s | −0.4 ~ −1.6 GiB |
-| MoE，8 专家，seq 8192 | 9.83 s | 10.40 s | 13.08 s | −1.5 ~ −1.6 GiB |
+| dense 7.5B，seq 4096，PP4 × DP1 | 9.96 s | 10.18 s | 12.72 s | −0.4 ~ −1.6 GiB |
+| MoE，8 专家，seq 8192，PP4 × DP1 | 9.83 s | 10.40 s | 13.08 s | −1.5 ~ −1.6 GiB |
+| MoE，8 专家，seq 8192，PP2 × DP2 × EP2 | 19.08 s | 未跑 | 26.33 s | −1.3 ~ −1.6 GiB |
 
-**最需要补的是 DP > 1 和 EP > 1 的数据**：目前的 GPU 验证全部是 DP1、EP1，公式里按 1/d 切分的部分（状态的 12/d、step 的 6/d、专家参数的 dp/ep）还没有在这个版本上用 GPU 验证过。
+最后一行是用 `MODEL=moe PP=2 EP=2 bash run_experiment.sh` 跑出来的，验证了公式里按 1/d 切分的部分（状态的 12/d，以及专家参数按 dp/ep 切分）。
+
+**还需要补的数据**：更大的 DP 和 EP、多节点，以及 NVIDIA GPU。另外，step 阶段的 6/d 目前只在 DP1 下逼近显存上限时验证过，在 DP 更大时它不会是峰值。
