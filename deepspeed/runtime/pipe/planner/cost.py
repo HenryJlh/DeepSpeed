@@ -74,9 +74,12 @@ def model_state_bytes(num_params, dp_size=1):
 def optimizer_step_bytes(num_params, dp_size=1):
     """Memory the bf16 + ZeRO-1 + Adam optimizer step needs for a parameter group, on top of the model states.
 
-    Measured as 6 bytes per parameter of the group, sharded over the ``dp_size`` ranks that share its
-    partition. It includes the group's fp32 gradient partition (4 bytes per parameter), which is one
-    flat tensor and so needs contiguous memory.
+    6 bytes per parameter of the group's partition (the group over ``dp_size``), from the step of
+    ``DeepSpeedZeroOptimizer`` with bf16 gradients: it flattens the group's bf16 gradients into a new
+    tensor (2 bytes) and casts that to an fp32 gradient partition (4 bytes) while the bf16 gradients are
+    still allocated. It then frees the flat copy and the partition's bf16 gradients before Adam runs, so
+    Adam's temporaries fit in the same 6 bytes, and frees the fp32 partition before the next group.
+    The fp32 partition is one tensor, so its 4 bytes must be contiguous.
     """
     return num_params * 6 / dp_size
 
